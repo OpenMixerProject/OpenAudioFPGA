@@ -11,8 +11,17 @@ report_timing -setup -from_clock rmii -to $rx -npaths 20 -file cdc-bundle-rx.rpt
 report_timing -hold -from_clock aes_bclk -to $tx -npaths 20 -file cdc-bundle-tx-hold.rpt
 report_timing -hold -from_clock rmii -to $rx -npaths 20 -file cdc-bundle-rx-hold.rpt
 
-set stages [get_pins {console/rmii_started[0]~FF|CLK console/core/frame_matrix.good_m[1]~FF|CLK console/core/gen_aes50[0].u_aes50/audio_rst_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/bclk_rst_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/mdix_audio_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/tx_blk_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_tdm/rx_blk_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_tdm/tx_en_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_tdm/assm_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_link/clk_a_samples[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_link/clk_b_samples[0]~FF|CLK}]
+set stages [get_pins {console/rmii_started[0]~FF|CLK console/core/frame_matrix.good_m[1]~FF|CLK console/core/gen_aes50[0].u_aes50/audio_rst_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/bclk_rst_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/tx_blk_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_tdm/rx_blk_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_tdm/tx_en_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_tdm/assm_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_link/clk_a_samples[0]~FF|CLK console/core/gen_aes50[0].u_aes50/u_link/clk_b_samples[0]~FF|CLK}]
 report_timing -setup -from $stages -npaths 30 -file cdc-synchronizer-stages.rpt
+
+# The two reset chains use asynchronous SR on both stages, not a remote D input.
+set reset_launch [get_pins {console/core/gen_aes50[0].u_aes50/audio_rst_sync[0]~FF|CLK console/core/gen_aes50[0].u_aes50/bclk_rst_sync[0]~FF|CLK}]
+set reset_release [get_pins {console/core/gen_aes50[0].u_aes50/audio_rst_sync[1]~FF|D console/core/gen_aes50[0].u_aes50/bclk_rst_sync[1]~FF|D}]
+set reset_sr [get_pins {console/core/gen_aes50[0].u_aes50/audio_rst_sync[*]~FF|SR console/core/gen_aes50[0].u_aes50/bclk_rst_sync[*]~FF|SR}]
+foreach check {setup hold} {
+    report_timing -$check -from $reset_launch -to $reset_release -npaths 2 -file cdc-reset-release-$check.rpt
+    report_timing -$check -from_clock rmii -to $reset_sr -npaths 4 -file cdc-reset-sr-$check.rpt
+}
 
 set rmii_rx [get_ports {phy_b_dv phy_b_rxd0 phy_b_rxd1}]
 set rmii_tx [get_ports {phy_b_txen phy_b_txd0 phy_b_txd1}]
@@ -20,3 +29,8 @@ foreach check {setup hold} {
     report_timing -$check -from $rmii_rx -npaths 3 -file cdc-rmii-rx-$check.rpt
     report_timing -$check -to $rmii_tx -npaths 3 -file cdc-rmii-tx-$check.rpt
 }
+
+# Inspect physical routes even without an external sync transceiver budget.
+set sync_tx [get_ports {sync_b_a_d sync_b_a_de sync_b_b_d sync_b_b_de}]
+report_path -to $sync_tx -npaths 12 -file cdc-sync-tx-max.rpt
+report_path -min_path -to $sync_tx -npaths 12 -file cdc-sync-tx-min.rpt

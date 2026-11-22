@@ -40,10 +40,10 @@ index b91c6c7..05dfdbe 100644
  			end if;
  
 diff --git a/rtl/aes50_core.vhd b/rtl/aes50_core.vhd
-index f914608..52101d9 100644
+index f914608..67d98d9 100644
 --- a/rtl/aes50_core.vhd
 +++ b/rtl/aes50_core.vhd
-@@ -163,14 +163,18 @@ architecture rtl of aes50_core is
+@@ -163,11 +163,13 @@ architecture rtl of aes50_core is
  	signal phy_rst_cnt		: natural range 0 to 50000;				-- 1 ms PHY reset
  	signal pll_busy_sync	: std_logic_vector(1 downto 0);
  	signal core_rst			: std_logic := '1';						-- clk50 domain
@@ -59,12 +59,7 @@ index f914608..52101d9 100644
  
  	-- ------------------------------------------------------------ link / clocks
  	signal mdix				: std_logic;
-+	signal mdix_audio_sync	: std_logic_vector(1 downto 0) := "00";
-+	attribute async_reg of mdix_audio_sync : signal is true;
- 	signal aes_clock_ok		: std_logic;
- 	signal audio_clock_ok	: std_logic;
- 	signal rx_ok			: std_logic;
-@@ -199,6 +203,8 @@ architecture rtl of aes50_core is
+@@ -199,6 +201,8 @@ architecture rtl of aes50_core is
  	signal tx_blk_sync		: std_logic_vector(2 downto 0) := "000";
  	signal tx_base			: unsigned(AW - 1 downto 0);
  	signal tx_assm			: std_logic;
@@ -73,7 +68,7 @@ index f914608..52101d9 100644
  	signal framer_start		: std_logic;
  	signal framer_busy		: std_logic;
  	signal framer_auxv		: std_logic;
-@@ -217,6 +223,7 @@ architecture rtl of aes50_core is
+@@ -217,6 +221,7 @@ architecture rtl of aes50_core is
  	signal tdm_aux_tgl		: std_logic;
  	signal tdm_aux_page		: unsigned(1 downto 0);
  	signal tdm_aux_sync		: std_logic_vector(2 downto 0) := "000";
@@ -81,63 +76,7 @@ index f914608..52101d9 100644
  	signal tdm_aux_ready	: std_logic;							-- a complete page waits for the framer
  	signal tdm_aux_rpage	: unsigned(1 downto 0);
  
-@@ -300,23 +307,22 @@ begin
- 		end if;
- 	end process;
- 
--	-- asynchronous assertion, synchronous release in the audio clock domains
--	process (clk_1024xfs_from_pll_i, core_rst)
-+	-- WING supplies free-running audio/BCLK before core_rst is released, and
-+	-- holds core_rst for at least the 1 ms PHY reset. Only the first FF samples
-+	-- the remote level; both assertion and release downstream are local.
-+	process (clk_1024xfs_from_pll_i)
- 	begin
--		if core_rst = '1' then
--			audio_rst_sync <= "11";
--		elsif rising_edge(clk_1024xfs_from_pll_i) then
--			audio_rst_sync <= audio_rst_sync(0) & '0';
-+		if rising_edge(clk_1024xfs_from_pll_i) then
-+			audio_rst_sync <= audio_rst_sync(0) & core_rst;
-+			mdix_audio_sync <= mdix_audio_sync(0) & mdix;
- 		end if;
- 	end process;
- 	audio_rst <= audio_rst_sync(1);
- 
--	process (bclk_readback_i, core_rst)
-+	process (bclk_readback_i)
- 	begin
--		if core_rst = '1' then
--			bclk_rst_sync <= "11";
--		elsif rising_edge(bclk_readback_i) then
--			bclk_rst_sync <= bclk_rst_sync(0) & '0';
-+		if rising_edge(bclk_readback_i) then
-+			bclk_rst_sync <= bclk_rst_sync(0) & core_rst;
- 		end if;
- 	end process;
- 	bclk_rst <= bclk_rst_sync(1);
-@@ -337,10 +343,17 @@ begin
- 	-- sync signal pins: in MDI the A pair transmits and the B pair receives
- 	aes_clk_in	<= aes50_clk_b_rx_i when mdix = '0' else aes50_clk_a_rx_i;
- 	aes_clk_out	<= aes_clk_in when sys_mode_i = "00" else aes_clk_gen;	-- AES slave: loop back
--	aes50_clk_a_tx_o	<= aes_clk_out when (mdix = '0' and core_rst = '0') else '0';
--	aes50_clk_b_tx_o	<= aes_clk_out when (mdix = '1' and core_rst = '0') else '0';
--	aes50_clk_a_tx_en_o	<= '1' when (mdix = '0' and core_rst = '0') else '0';
--	aes50_clk_b_tx_en_o	<= '1' when (mdix = '1' and core_rst = '0') else '0';
-+	process (clk_1024xfs_from_pll_i)
-+	begin
-+		if rising_edge(clk_1024xfs_from_pll_i) then
-+			if audio_rst = '1' or aes_clk_gen = '0' then
-+				aes50_clk_a_tx_en_o <= not mdix_audio_sync(1) and not audio_rst;
-+				aes50_clk_b_tx_en_o <= mdix_audio_sync(1) and not audio_rst;
-+			end if;
-+		end if;
-+	end process;
-+	aes50_clk_a_tx_o <= aes_clk_out and aes50_clk_a_tx_en_o;
-+	aes50_clk_b_tx_o <= aes_clk_out and aes50_clk_b_tx_en_o;
- 
- 	-- PLL reference and multiplicator (as v1)
- 	clk_to_pll_o <= aes_clk_in		when (sys_mode_i = "00" and core_rst = '0') else
-@@ -441,6 +454,10 @@ begin
+@@ -441,6 +446,10 @@ begin
  			end if;
  
  			if tx_blk_sync(2) /= tx_blk_sync(1) and framer_busy = '0' and audio_clock_ok = '1' and core_rst = '0' then
@@ -148,7 +87,7 @@ index f914608..52101d9 100644
  				framer_start	<= '1';
  				tx_started		<= '1';
  				-- aux words of this block: a ready page or the idle pattern (v1: FIFO filled or empty)
-@@ -466,6 +483,10 @@ begin
+@@ -466,6 +475,10 @@ begin
  				uart_aux_rpage	<= '0';
  				tx_started		<= '0';
  			end if;
@@ -159,7 +98,7 @@ index f914608..52101d9 100644
  		end if;
  	end process;
  
-@@ -477,7 +498,7 @@ begin
+@@ -477,7 +490,7 @@ begin
  		generic map (G_AW => AW)
  		port map (
  			clk_i => clk50_i, rst_i => core_rst, fs48_i => fs48, i2s_i => i2s_mode,
@@ -168,7 +107,7 @@ index f914608..52101d9 100644
  			busy_o => framer_busy, frame_o => open,
  			ram_addr_o => txr_raddr, ram_data_i => txr_rdata,
  			aux_addr_o => framer_aux_addr, aux_data_i => framer_aux_data,
-@@ -599,7 +620,7 @@ begin
+@@ -599,7 +612,7 @@ begin
  	begin
  		if rising_edge(clk50_i) then
  			assm_dbg_sync <= assm_dbg_sync(1 downto 0) & assm_tgl;

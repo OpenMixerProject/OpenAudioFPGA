@@ -10,7 +10,10 @@ end entity;
 architecture test of tb_aes50_b_cdc is
     constant AUDIO_HALF : time := 10.172526 ns;
     signal clk_audio, clk_rmii : std_logic := '0';
+    signal audio_stopped, bclk_stopped : boolean := false;
     signal phy_reset_n, link_ok, dropped : std_logic;
+    -- Waveform checkpoints: bit 3 toggles, bits 2:0 expect core/audio/BCLK reset.
+    signal reset_check : std_logic_vector(3 downto 0) := "0XXX";
     signal rst : std_logic := '1';
     signal phase : unsigned(9 downto 0) := (others => '0');
     signal bclk, fs : std_logic;
@@ -25,7 +28,7 @@ architecture test of tb_aes50_b_cdc is
         return std_logic_vector(to_unsigned(16#800000# + (frame mod 16384) * 64 + channel, 24));
     end function;
 begin
-    clk_audio <= not clk_audio after AUDIO_HALF;
+    clk_audio <= not clk_audio after AUDIO_HALF when not audio_stopped else '0';
     process
     begin
         wait for G_RMII_PHASE_NS * 1 ns;
@@ -45,7 +48,7 @@ begin
             else fs <= '0'; end if;
         end if;
     end process;
-    bclk <= not phase(1);
+    bclk <= not phase(1) when not bclk_stopped else '0';
 
     -- Model the WING pad stages and a wire with non-zero delay. Use the
     -- actual framer, deframer and dual-clock sample RAMs, not a toggle mock.
@@ -153,6 +156,23 @@ begin
     end process;
 
     process
+        procedure expect_reset(expected : std_logic_vector(2 downto 0)) is
+        begin
+            reset_check <= not reset_check(3) & expected;
+        end procedure;
+
+        procedure check_release(signal clk : in std_logic; held, released : std_logic_vector(2 downto 0)) is
+        begin
+            wait until rising_edge(clk);
+            wait for 1 ns;
+            expect_reset(held);
+            wait until falling_edge(clk);
+            wait for 1 ns;
+            expect_reset(held);
+            wait until rising_edge(clk);
+            wait for 1 ns;
+            expect_reset(released);
+        end procedure;
     begin
         wait for 163 ns;
         for round in 0 to 1 loop
@@ -169,6 +189,33 @@ begin
             end if;
         end loop;
         report "PASS 144 consecutive sample frames, 48 changing channels each, RMII loop and in-flight reset";
+
+        -- Stop BCLK and its source low after the link has carried traffic.
+        wait until falling_edge(bclk);
+        wait until falling_edge(clk_audio);
+        audio_stopped <= true;
+        bclk_stopped <= true;
+        expect_reset("000");
+        wait for 37 ns;
+        rst <= '1';
+        wait until falling_edge(phy_reset_n) for 100 ns;
+        assert phy_reset_n = '0' report "PHY reset did not assert" severity failure;
+        wait for 1 ns;
+        expect_reset("111");
+
+        rst <= '0';
+        wait until rising_edge(phy_reset_n) for 2 ms;
+        assert phy_reset_n = '1' report "PHY reset did not release" severity failure;
+        wait for 113 ns;
+        assert clk_audio = '0' and bclk = '0' severity failure;
+        expect_reset("011");
+        audio_stopped <= false;
+        check_release(clk_audio, "011", "001");
+        wait until rising_edge(phase(1)); -- ungate BCLK only while its source is low
+        expect_reset("001");
+        bclk_stopped <= false;
+        check_release(bclk, "001", "000");
+        wait for 1 ns; -- let the last checkpoint reach the waveform before stopping
         std.env.stop;
         wait;
     end process;
