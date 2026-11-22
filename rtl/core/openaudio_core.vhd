@@ -93,7 +93,10 @@ entity openaudio_core is
 		-- audio clock tree (see audioclk.vhd). With the AES67 core the divider follows its
 		-- frame sync (PTP), else fs_sync_i.
 		G_FS_SYNC_CNT			: natural range 0 to 511 := 0;
-		G_FS_ADVANCE			: natural range 0 to 511 := 3
+		G_FS_ADVANCE			: natural range 0 to 511 := 3;
+		G_FRAME_ROUTES : natural := 0;
+		G_DSP_LANES : positive := 1;
+		G_DSP_RX_USED, G_DSP_TX_USED : std_logic_vector(15 * G_DSP_LANES - 1 downto 0) := (others => '0')
 	);
 	port (
 		-- audio clocks
@@ -103,6 +106,15 @@ entity openaudio_core is
 		clk_fs512_o			: out std_logic;			-- 512 fs
 		clk_fs256_o			: out std_logic;			-- 256 fs = TDM8 bit clock
 		fsync_o				: out std_logic;			-- fs = TDM8 frame sync
+
+		frame_reset_i : in std_logic := '0';
+		frame_phase_o : out unsigned(9 downto 0);
+		dsp_tdm_i, dsp_valid_i : in std_logic_vector(G_DSP_LANES - 1 downto 0) := (others => '0');
+		dsp_tdm_o : out std_logic_vector(G_DSP_LANES - 1 downto 0);
+		dsp_tx_enable_i : in std_logic_vector(G_DSP_LANES - 1 downto 0) := (others => '1');
+		dsp_reset_release_o, dsp_audio_enable_o, dsp_audio_valid_o : out std_logic_vector(3 downto 0);
+		frame_ready_o : out std_logic;
+		frame_status_extra_i : in std_logic := '0'; -- benchmark observation only
 
 		-- control bus (SPIBone, see above; clocked with clk50_i)
 		spi_ncs_i			: in  std_logic;
@@ -162,7 +174,11 @@ end entity openaudio_core;
 architecture rtl of openaudio_core is
 	constant C_DATA_WIDTH	: integer := 24;
 	-- channel numbers of the matrix (destinations and sources + 1)
-	constant C_ADDR_WIDTH	: integer := 8;
+	function addr_width return positive is
+	begin
+		if G_FRAME_ROUTES > 0 then return 10; else return 8; end if;
+	end;
+	constant C_ADDR_WIDTH : integer := addr_width;
 	-- CSR core_version: bump when the register map of the control bus changes
 	constant C_VERSION		: std_logic_vector(31 downto 0) := x"00030000";
 	constant C_AES50_LINES	: natural := 6;		-- TDM lines per AES50 core (48 channels)
@@ -203,6 +219,9 @@ architecture rtl of openaudio_core is
 	signal aes67_s2m		: t_wb_s2m;
 	signal core_info		: std_logic_vector(31 downto 0);
 	signal soc_miso			: std_logic;
+	signal soc_clk, matrix_clk, frame_scan, route_ready : std_logic;
+	signal wing_status : std_logic_vector(31 downto 0) := (others => '0');
+	signal aes50_ok : std_logic_vector(G_AES50_PORTS - 1 downto 0);
 
 	signal tdm_rx			: std_logic_vector(G_TDM_LINES_IN - 1 downto 0);
 	signal tdm_tx			: std_logic_vector(G_TDM_LINES_OUT - 1 downto 0);
@@ -227,6 +246,8 @@ architecture rtl of openaudio_core is
 			core_info			: in  std_logic_vector(31 downto 0);
 			core_version		: in  std_logic_vector(31 downto 0);
 			core_config			: out std_logic_vector(7 downto 0);
+			wing_status : in std_logic_vector(31 downto 0);
+			wing_reset_release, wing_audio_enable, wing_audio_valid : out std_logic_vector(3 downto 0);
 			routing_wb_adr		: out std_logic_vector(29 downto 0);
 			routing_wb_dat_w	: out std_logic_vector(31 downto 0);
 			routing_wb_dat_r	: in  std_logic_vector(31 downto 0);
@@ -337,6 +358,12 @@ begin
 		fs_sync <= fs_sync_i;
 	end generate;
 
+	legacy_clock : if G_FRAME_ROUTES = 0 generate
+	soc_clk <= clk50_i;
+	matrix_clk <= clk_fs512;
+	frame_scan <= '0';
+	frame_phase_o <= (others => '0');
+	dsp_tdm_o <= (others => '0');
 	u_audioclk : entity work.audioclk
 		generic map (
 			AES67_SYNC_CNT => G_FS_SYNC_CNT,
@@ -351,6 +378,7 @@ begin
 			fs_x_128_o => open,
 			fs_x_64_o => open,
 			fs_o => fsync);
+	end generate;
 
 	clk_fs512_o <= clk_fs512;
 	clk_fs256_o <= clk_fs256;
@@ -367,7 +395,7 @@ begin
 
 	u_soc : openaudio_soc
 		port map (
-			clk_sys => clk50_i,
+			clk_sys => soc_clk,
 			spibone_clk => spi_clk_i,
 			spibone_cs_n => spi_ncs_i,
 			spibone_mosi => spi_mosi_i,
@@ -375,6 +403,10 @@ begin
 			core_info => core_info,
 			core_version => C_VERSION,
 			core_config => cfg_bits_o,
+			wing_status => wing_status,
+			wing_reset_release => dsp_reset_release_o,
+			wing_audio_enable => dsp_audio_enable_o,
+			wing_audio_valid => dsp_audio_valid_o,
 			routing_wb_adr => routing_m2s.adr,
 			routing_wb_dat_w => routing_m2s.dat,
 			routing_wb_dat_r => routing_s2m.dat,
@@ -405,6 +437,7 @@ begin
 	------------------------------------------------------------------------
 	-- TDM8 receivers -> audio RAM -> routing -> TDM8 senders
 	------------------------------------------------------------------------
+	legacy_matrix : if G_FRAME_ROUTES = 0 generate
 	gen_ext_in : for i in 0 to G_TDM_LINES_IN - 1 generate
 		gen_pin : if not is_aes50_line(i) and not is_aes67_line(i) generate
 			tdm_rx(i) <= tdm_i(i);
@@ -449,26 +482,6 @@ begin
 			read_addr => ram_rd_addr,
 			o_data => ram_rd_data);
 
-	-- routing RAM: Wishbone (clk50_i) writes, the matrix (clk_fs512) reads
-	u_routing : entity work.routing_wb
-		generic map (
-			G_AW => C_ADDR_WIDTH,
-			G_WIN_AW => 14)		-- 64 KiB window (litex_soc/generate.py)
-		port map (
-			wb_clk_i => clk50_i,
-			wb_adr_i => routing_m2s.adr,
-			wb_dat_i => routing_m2s.dat,
-			wb_dat_o => routing_s2m.dat,
-			wb_sel_i => routing_m2s.sel,
-			wb_cyc_i => routing_m2s.cyc,
-			wb_stb_i => routing_m2s.stb,
-			wb_we_i => routing_m2s.we,
-			wb_ack_o => routing_s2m.ack,
-			wb_err_o => routing_s2m.err,
-			mtx_clk_i => clk_fs512,
-			mtx_channel_i => channel_idx,
-			mtx_source_o => ram_rd_addr);
-
 	u_ram_read : entity work.audiomatrix_ram_read
 		generic map (
 			TDM_SENDER => G_TDM_LINES_OUT,
@@ -493,8 +506,174 @@ begin
 			data_in => tx_par,
 			tdm_out => tdm_tx);
 
-	tdm_o <= tdm_tx;
 	tdm_par_o <= tx_par;
+	end generate;
+
+	tdm_o <= tdm_tx;
+	aes50_ok_o <= aes50_ok;
+	frame_ready_o <= wing_status(0);
+	-- One address decoder and routing RAM for both implementations.
+	u_routing : entity work.routing_wb
+		generic map (G_AW => C_ADDR_WIDTH, G_WIN_AW => 14, G_FRAME_ROUTES => G_FRAME_ROUTES)
+		port map (
+			wb_clk_i => soc_clk, wb_adr_i => routing_m2s.adr,
+			wb_dat_i => routing_m2s.dat, wb_dat_o => routing_s2m.dat, wb_sel_i => routing_m2s.sel,
+			wb_cyc_i => routing_m2s.cyc, wb_stb_i => routing_m2s.stb, wb_we_i => routing_m2s.we,
+			wb_ack_o => routing_s2m.ack, wb_err_o => routing_s2m.err,
+			mtx_clk_i => matrix_clk, mtx_channel_i => channel_idx, mtx_source_o => ram_rd_addr,
+			frame_reset_i => frame_reset_i, frame_read_i => frame_scan, frame_ready_o => route_ready);
+
+	frame_matrix : if G_FRAME_ROUTES > 0 generate
+		constant C_DSP_CHANNELS : natural := 324;
+		constant C_AES_LANES : natural := 18; -- A/B/C IDs reserved at every population
+		constant C_SCAN_FIRST : natural := G_DSP_LANES + C_AES_LANES + 1;
+		constant C_SCAN_END : natural := C_SCAN_FIRST + G_FRAME_ROUTES;
+		signal phase : unsigned(9 downto 0) := (others => '0');
+		signal bank : std_logic := '0';
+		signal frames : natural range 0 to 2 := 0;
+		signal dsp_wr, dsp_rd, aes_wr, aes_rd, cap_we, play_we, source_valid : std_logic := '0';
+		signal cap_bank, play_bank, dsp_next, aes_next, dsp_play_valid, aes_play_valid, audio_rst : std_logic;
+		signal dsp_wa, dsp_ra, aes_wa, aes_ra : unsigned(8 downto 0);
+		signal cap_wa, cap_ra, play_wa, play_ra : std_logic_vector(9 downto 0);
+		signal dsp_data, aes_data, capture_data, source_data, playback_data, routed_data : std_logic_vector(31 downto 0);
+		signal dest_d1, dest_d2 : unsigned(9 downto 0) := (others => '0');
+		signal enable_d1, enable_d2 : std_logic := '0';
+		signal good_m, good_s, good_frame, port_good : std_logic_vector(2 downto 0) := (others => '0');
+	attribute async_reg : boolean;
+	attribute async_reg of good_m, good_s : signal is true;
+		signal aes_in, aes_out, aes_out_hold, aes_in_valid : std_logic_vector(C_AES_LANES - 1 downto 0);
+		function port_index(idx : natural) return natural is
+		begin
+			if idx = 0 then return 1; elsif idx = 1 then return 0; else return 2; end if;
+		end;
+		function endpoint(idx : integer) return boolean is
+		begin
+			return (idx >= 0 and idx < 64) or (idx >= 104 and idx < 154) or
+			       (idx >= 204 and idx < 236) or (idx >= 308 and idx < C_DSP_CHANNELS) or
+			       (G_AES50_PORTS > 0 and idx >= 372 and idx < 420) or
+			       (G_AES50_PORTS > 1 and idx >= 324 and idx < 372) or
+			       (G_AES50_PORTS > 2 and idx >= 420 and idx < 468);
+		end;
+		function aes_slots return std_logic_vector is
+			variable v : std_logic_vector(15 * C_AES_LANES - 1 downto 0);
+		begin
+			for i in 0 to C_AES_LANES - 1 loop
+				v(15*i+14 downto 15*i) := std_logic_vector(to_unsigned(i*8*64+8, 15));
+			end loop;
+			return v;
+		end;
+		-- Component leaves legacy projects' source lists unchanged.
+		component tdm_frame_io is
+			generic (G_LANES, G_SLOTS, G_FIRST, G_IO_FIRST, G_PAYLOAD_BITS : natural;
+			         G_RX_USED, G_TX_USED : std_logic_vector(15 * G_LANES - 1 downto 0));
+			port (clk, rst : in std_logic; phase : in unsigned(9 downto 0);
+			      lane_in, lane_valid : in std_logic_vector(G_LANES - 1 downto 0);
+			      lane_out : out std_logic_vector(G_LANES - 1 downto 0);
+			      rx_we, tx_req : out std_logic; rx_addr, tx_addr : out unsigned(8 downto 0);
+			      rx_sample : out std_logic_vector(31 downto 0); tx_sample : in std_logic_vector(31 downto 0);
+			      tx_valid : in std_logic;
+		      lane_tx_enable : in std_logic_vector(G_LANES - 1 downto 0) := (others => '1'));
+		end component;
+	begin
+		assert not G_AES67 and G_AES50_FIRST_LINE = 0 and G_AES50_PORTS <= 3 severity failure;
+		assert C_SCAN_END + 2 < (1024 - 128) severity failure;
+		assert G_DSP_LANES = G_DSP_RX_USED'length / 15 and G_DSP_RX_USED'length = G_DSP_TX_USED'length severity failure;
+		soc_clk <= clk_fs1024_i;
+		matrix_clk <= clk_fs1024_i;
+		audio_rst <= frame_reset_i or not route_ready;
+		frame_phase_o <= phase;
+		clk_fs512 <= phase(0); -- SHARC CKRE=0: drive rising, sample falling
+		clk_fs256 <= not phase(1);
+		-- Launch wide of the fabric BCLK tree's capture edge. FS stays high
+		-- for one BCLK before sample 0 (AES50 G_FSYNC_DELAY = 1).
+		process (matrix_clk)
+		begin
+			if falling_edge(matrix_clk) then
+				aes_out_hold <= aes_out;
+				if phase >= 1018 and phase <= 1021 then fsync <= '1';
+				else fsync <= '0'; end if;
+			end if;
+		end process;
+		wing_status <= frame_status_extra_i & (30 downto 4 => '0') & good_s & not audio_rst;
+		tdm_par_o <= (others => '0');
+		tdm_tx(G_TDM_LINES_OUT - 1 downto 6 * G_AES50_PORTS) <= (others => '0');
+
+		dsp_io : tdm_frame_io
+			generic map (G_DSP_LANES, 16, 0, 0, 32, G_DSP_RX_USED, G_DSP_TX_USED)
+			port map (matrix_clk, audio_rst, phase, dsp_tdm_i, dsp_valid_i, dsp_tdm_o,
+			          dsp_wr, dsp_rd, dsp_wa, dsp_ra, dsp_data, playback_data, dsp_play_valid, dsp_tx_enable_i);
+		aes_io : tdm_frame_io
+			generic map (C_AES_LANES, 8, C_DSP_CHANNELS, G_DSP_LANES, 24, aes_slots, aes_slots)
+			port map (matrix_clk, audio_rst, phase, aes_in, aes_in_valid,
+			          aes_out, aes_wr, aes_rd, aes_wa, aes_ra,
+			          aes_data, playback_data, aes_play_valid);
+		aes_present : for k in 0 to G_AES50_PORTS - 1 generate
+			constant p : natural := port_index(k);
+		begin
+			aes_in(6*p+5 downto 6*p) <= tdm_rx(6*k+5 downto 6*k);
+			tdm_tx(6*k+5 downto 6*k) <= aes_out_hold(6*p+5 downto 6*p);
+			port_good(p) <= aes50_ok(k);
+		end generate;
+		aes_missing : for k in G_AES50_PORTS to 2 generate
+			constant p : natural := port_index(k);
+		begin
+			aes_in(6*p+5 downto 6*p) <= (others => '0');
+			port_good(p) <= '0';
+		end generate;
+		good_lanes : for i in aes_in_valid'range generate
+			aes_in_valid(i) <= good_frame(i / 6);
+		end generate;
+
+		-- Last-slot capture finishes before the scan. Selectors and audio
+		-- RAM are each one cycle; 768 + 2 cycles fit before slot-0 prefetch.
+		frame_scan <= '1' when phase >= C_SCAN_FIRST and phase < C_SCAN_END and
+		                       frames > 0 and audio_rst = '0' else '0';
+		channel_idx <= std_logic_vector(resize(phase - C_SCAN_FIRST, C_ADDR_WIDTH)) when frame_scan = '1' else (others => '0');
+		cap_bank <= not bank when phase < C_SCAN_FIRST else bank;
+		cap_wa <= cap_bank & std_logic_vector(dsp_wa) when dsp_wr = '1' else cap_bank & std_logic_vector(aes_wa);
+		cap_we <= dsp_wr or aes_wr;
+		capture_data <= dsp_data when dsp_wr = '1' else aes_data;
+		cap_ra <= not bank & std_logic_vector(unsigned(ram_rd_addr(8 downto 0)) - 1);
+		capture_ram : entity work.audiomatrix_ram
+			generic map (32, 1024, 10)
+			port map (matrix_clk, cap_wa, capture_data, cap_we, cap_ra, source_data);
+
+		dsp_next <= '1' when phase >= 960 else '0';
+		aes_next <= '1' when phase >= 896 else '0';
+		play_bank <= bank xor dsp_next when dsp_rd = '1' else bank xor aes_next;
+		play_ra <= play_bank & std_logic_vector(dsp_ra) when dsp_rd = '1' else play_bank & std_logic_vector(aes_ra);
+		dsp_play_valid <= '1' when frames = 2 or (frames = 1 and dsp_next = '1') else '0';
+		aes_play_valid <= '1' when frames = 2 or (frames = 1 and aes_next = '1') else '0';
+		play_wa <= not bank & std_logic_vector(dest_d2(8 downto 0));
+		play_we <= enable_d2 and not audio_rst when endpoint(to_integer(dest_d2)) else '0';
+		routed_data <= source_data when source_valid = '1' else (others => '0');
+		playback_ram : entity work.audiomatrix_ram
+			generic map (32, 1024, 10)
+			port map (matrix_clk, play_wa, routed_data, play_we, play_ra, playback_data);
+
+		process (matrix_clk)
+		begin
+			if rising_edge(matrix_clk) then
+				good_m <= port_good;
+				good_s <= good_m;
+				if audio_rst = '1' then
+					phase <= (others => '0'); bank <= '0'; frames <= 0;
+					enable_d1 <= '0'; enable_d2 <= '0'; good_frame <= (others => '0');
+				else
+					phase <= phase + 1;
+					if phase = 1023 then
+						bank <= not bank;
+						good_frame <= good_s;
+						if frames < 2 then frames <= frames + 1; end if;
+					end if;
+					dest_d1 <= unsigned(channel_idx); dest_d2 <= dest_d1;
+					enable_d1 <= frame_scan; enable_d2 <= enable_d1;
+					if unsigned(ram_rd_addr) > 0 and endpoint(to_integer(unsigned(ram_rd_addr)) - 1) then source_valid <= '1';
+					else source_valid <= '0'; end if;
+				end if;
+			end if;
+		end process;
+	end generate;
 
 	------------------------------------------------------------------------
 	-- AES50 cores
@@ -553,7 +732,7 @@ begin
 				tdm_o => aes50_tdm_out,
 				i2s_i => '0',
 				i2s_o => open,
-				aes_ok_o => aes50_ok_o(k),
+				aes_ok_o => aes50_ok(k),
 				rx_blk_drop_o => open,
 				dbg_o => open,
 				uart_o => aes50_uart_o(k),

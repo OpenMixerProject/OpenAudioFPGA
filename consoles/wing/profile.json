@@ -1,0 +1,53 @@
+{
+  "profile": "wing-trion-stock-directions-tdm32-v1",
+  "sample_rate_hz": 48000,
+  "slots": 32,
+  "audio_data_width": 32,
+  "word_format": "signed Q4.28",
+  "bclk_hz": 49152000,
+  "clkin_hz": 12288000,
+  "fs_delay_bits": 1,
+  "clock_role": "fpga-master",
+  "dsp": [
+    {
+      "id": 1, "role": "input", "first_id": 0, "slots_used": 104,
+      "slot_roles": [[0,47,"raw/post_eq"],[48,95,"insert_return/pre_fader"],[96,103,"fx_return/fx_pre_fader"]],
+      "reset_n": ["U12","GPIOB_RXN06"], "clkin": ["H11","GPIOT_RXN03"],
+      "spi": {"mosi":["B20","GPIOR_175"],"miso":["T14","GPIOB_RXP18"],"sck":["C21","GPIOR_178"],"sel":["B21","GPIOR_177"]},
+      "rx_clock": [8,"D22","GPIOR_183"], "rx_fs": [14,"D20","GPIOR_179"],
+      "tx_clock": [4,"R13","GPIOB_RXN15"], "tx_fs": [18,"G17","GPIOT_RXP29"],
+      "rx": [[7,"R14","GPIOB_RXP15"],[13,"D19","GPIOR_173"],[19,"B22","GPIOR_180"],[2,"R15","GPIOB_RXN21"]],
+      "tx": [[1,"A21","GPIOR_176"],[17,"D21","GPIOR_184"],[16,"V12","GPIOB_RXP08"],[12,"H16","GPIOT_RXN27"],[15,"E22","GPIOR_185"],[11,"E21","GPIOR_181"],[6,"U13","GPIOB_RXN12"]]
+    },
+    {
+      "id": 2, "role": "bus", "first_id": 104, "slots_used": 100,
+      "slot_roles": [[0,49,"premix/post_eq"],[50,99,"insert_return/pre_fader"]],
+      "reset_n": ["B14","GPIOT_RXP15"], "clkin": ["C6","GPIOT_TXP10"],
+      "spi": {"mosi":["D11","GPIOT_RXN02"],"miso":["A10","GPIOT_TXP25"],"sck":["E9","GPIOT_TXP21"],"sel":["G9","GPIOT_TXP22"]},
+      "rx_clock": [8,"E14","GPIOT_RXP19"], "rx_fs": [14,"A13","GPIOT_RXN11"],
+      "tx_clock": [4,"G10","GPIOT_TXN26"], "tx_fs": [18,"E11","GPIOT_RXP02"],
+      "rx": [[17,"H8","GPIOT_TXP20"],[16,"A14","GPIOT_RXN15"],[12,"B13","GPIOT_RXP13"],[15,"G11","GPIOT_RXP03"],[11,"D15","GPIOT_RXN22"],[6,"E10","GPIOT_TXN24"],[2,"B11","GPIOT_RXN01"]],
+      "tx": [[7,"A11","GPIOT_RXP01"],[13,"B10","GPIOT_TXN25"],[19,"H9","GPIOT_TXN22"],[1,"E12","GPIOT_RXN09"]]
+    },
+    {
+      "id": 3, "role": "fx1", "first_id": 204, "slots_used": 56,
+      "slot_roles": [[0,47,"raw/gate_eq_comp"],[48,55,"fx_return/fx_pre_fader"]],
+      "reset_n": null, "clkin": ["A3","GPIOT_TXN06"],
+      "spi": {"mosi":["C4","GPIOT_TXN03"],"miso":["A4","GPIOT_TXP06"],"sck":["A5","GPIOT_TXP07"],"sel":["B5","GPIOT_TXN07"]},
+      "rx_clock": [8,"E8","GPIOT_TXP16"], "rx_fs": [14,"A8","GPIOT_TXN18"],
+      "tx_clock": [4,"B7","GPIOT_TXN14"], "tx_fs": [18,"F8","GPIOT_TXN16"],
+      "rx": [[17,"D9","GPIOT_TXN21"],[16,"B8","GPIOT_TXP18"],[10,"A7","GPIOT_TXP14"],[12,"G8","GPIOT_TXN20"]],
+      "tx": [[20,"F7","GPIOT_TXN13"],[9,"C7","GPIOT_TXN10"]]
+    },
+    {
+      "id": 4, "role": "fx2", "first_id": 308, "slots_used": 16,
+      "slot_roles": [[0,15,"fx_send/fx_result"]],
+      "reset_n": ["A2","GPIOT_TXP05"], "clkin": ["V15","GPIOB_RXP29"],
+      "spi": {"mosi":["K5","GPIOL_81"],"miso":["H3","GPIOL_131"],"sck":["E1","GPIOT_TXN01"],"sel":["F1","GPIOL_151"]},
+      "rx_clock": [8,"G4","GPIOL_138"], "rx_fs": [14,"R4","GPIOL_19"],
+      "tx_clock": [4,"C1","GPIOT_TXP04"], "tx_fs": [18,"G7","GPIOT_TXP15"],
+      "rx": [[17,"C3","GPIOT_TXP03"],[16,"B1","GPIOT_TXN04"],[10,"D2","GPIOT_TXP02"],[12,"C2","GPIOT_TXN02"]],
+      "tx": [[20,"D1","GPIOT_TXP01"],[9,"F4","GPIOL_156"]]
+    }
+  ]
+}

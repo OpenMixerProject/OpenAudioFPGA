@@ -1,108 +1,140 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: GPL-3.0-only
-"""Stage the WING Compact T55 project for Efinity (no programming)."""
+"""Stage the fork's mixed-language SoC and WING board wiring for Efinity."""
 import argparse
-import hashlib
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parents[1]
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "litex_soc"))
 from generate import build
+from wing_contract import BOARD_PROFILE, sha256
 
 NAME = "wing-fpga"
 DEVICE = "T55F484"
 VERSION = "2026.1.132"
-PROFILE = ROOT / "consoles/wing/profile-tdm16.json"
-PROFILE_SHA256 = "3b29934cdc1c704de69b6b028bc71387ab7c50cb74e811fb35ca0f64664a3e9d"
+AES50_REV = "bffe14e91636efe0c873adfc8244731d610f9e1c"
 HOST = {
-    "clk_audio": ("in", "R2", "GPIOL_15"),
+    "clk_audio": ("in", "R2", "GPIOL_15"), "clk_rmii": ("in", "M3", "GPIOL_67"),
     "host_sck": ("in", "W1", "GPIOL_01"), "host_mosi": ("in", "V2", "GPIOL_08"),
     "host_miso": ("inout", "V1", "GPIOL_09"), "ctrl_cs_n": ("in", "V6", "GPIOL_04"),
     "dsp_cs_n": ("in", "J2", "GPIOL_117"),
 }
-# Per DSP: MOSI, MISO, SCK, select, CLKIN, reset. DSP3 reset is not qualified.
-CONTROL = (
-    ("B20:GPIOR_175", "T14:GPIOB_RXP18", "C21:GPIOR_178", "B21:GPIOR_177", "H11:GPIOT_RXN03", "U12:GPIOB_RXN06"),
-    ("D11:GPIOT_RXN02", "A10:GPIOT_TXP25", "E9:GPIOT_TXP21", "G9:GPIOT_TXP22", "C6:GPIOT_TXP10", "B14:GPIOT_RXP15"),
-    ("C4:GPIOT_TXN03", "A4:GPIOT_TXP06", "A5:GPIOT_TXP07", "B5:GPIOT_TXN07", "A3:GPIOT_TXN06", None),
-    ("K5:GPIOL_81", "H3:GPIOL_131", "E1:GPIOT_TXN01", "F1:GPIOL_151", "V15:GPIOB_RXP29", "A2:GPIOT_TXP05"),
-)
+PORT_B = {
+    "phy_b_dv": ("in", "R10", "GPIOB_RXN01", "dv(0)"),
+    "phy_b_rxd0": ("in", "V9", "GPIOB_TXP19", "rxd(0)"),
+    "phy_b_rxd1": ("in", "AA15", "GPIOB_RXN20", "rxd(1)"),
+    "phy_b_txen": ("out", "U6", "GPIOL_12", "txen(0)"),
+    "phy_b_txd0": ("out", "Y14", "GPIOB_RXP16", "txd(0)"),
+    "phy_b_txd1": ("out", "AB13", "GPIOB_RXP10", "txd(1)"),
+    "phy_b_ref": ("out", "AB15", "GPIOB_RXP14", "clk_rmii"),
+    "phy_ab_reset_n": ("out", "W9", "GPIOB_TXN19", "phy_reset(0)"),
+    # Observe-only until R vs /RE is distinguished; neither is ever driven.
+    "sync_b_a_observe": ("in", "T6", "GPIOL_14", "sync_a_rx(0)"),
+    "sync_b_b_observe": ("in", "R7", "GPIOL_18", "sync_b_rx(0)"),
+    "sync_b_a_d": ("out", "L6", "GPIOL_72", "sync_a_tx(0)"),
+    "sync_b_a_de": ("out", "T4", "GPIOL_13", "sync_a_de(0)"),
+    "sync_b_b_d": ("out", "K7", "GPIOL_76", "sync_b_tx(0)"),
+    "sync_b_b_de": ("out", "AA12", "GPIOB_RXP05", "sync_b_de(0)"),
+}
 
 
-def emit_top(out, profile):
+def emit_top(out, profile, count):
     pins = dict(HOST)
     assignments = []
 
     def pin(name, mode, location, signal):
         ball, resource = location
-        if (name in pins or ball in {"A9", "AB9", "A6", "D10"}
-                or any(ball == p[1] or resource == p[2] for p in pins.values())):
-            raise ValueError(f"reserved or duplicate pin: {name} at {ball}/{resource}")
+        assert name not in pins and all(ball != p[1] and resource != p[2] for p in pins.values()), name
+        assert ball not in {"A9", "AB9", "A6", "D10"}
+        assert ball not in {"T6", "R7"} or mode == "in"
         pins[name] = (mode, ball, resource)
         left, right = (signal, name) if mode == "in" else (name, signal)
         assignments.append(f"    {left} <= {right};")
 
-    for i, locations in enumerate(CONTROL):
-        signals = ("dpi_mosi", "dpi_miso", "dpi_sck", "dpi_sel", "clkin", "reset_n")
-        for signal, location in zip(signals, locations):
-            if location:
-                pin(f"dsp{i+1}_{signal}", "in" if signal == "dpi_miso" else "out",
-                    location.split(":"), "clkin" if signal == "clkin" else f"{signal}({i})")
-
     used = {"tx": [], "rx": []}
     owners = {"tx": [], "rx": []}
+    width = profile["slots"]
     for i, dsp in enumerate(profile["dsp"]):
         n = dsp["id"]
-        control = [dsp["spi"][key] for key in ("mosi", "miso", "sck", "sel")] + [dsp["clkin"], dsp["reset_n"]]
-        if n != i + 1 or tuple(":".join(loc) if loc else None for loc in control) != CONTROL[i]:
-            raise ValueError(f"DSP{n} profile control pins differ from the board platform")
-        for direction in ("tx", "rx"):  # Directions in the profile are from the DSP's perspective.
+        assert n == i + 1
+        for signal, loc in dsp["spi"].items():
+            pin(f"dsp{n}_dpi_{signal}", "in" if signal == "miso" else "out", loc, f"dpi_{signal}({i})")
+        pin(f"dsp{n}_clkin", "out", dsp["clkin"], "clkin")
+        if dsp["reset_n"]:
+            pin(f"dsp{n}_reset_n", "out", dsp["reset_n"], f"reset_n({i})")
+        for direction in ("tx", "rx"):
             pin(f"dsp{n}_{direction}_bclk", "out", dsp[f"{direction}_clock"][1:], "bclk")
             pin(f"dsp{n}_{direction}_fs", "out", dsp[f"{direction}_fs"][1:], f"fs({i})")
             for lane, (_, ball, resource) in enumerate(dsp[direction]):
-                incoming = direction == "tx"
-                vec = "from_dsp" if incoming else "to_dsp"
-                pin(f"dsp{n}_{direction}_data{lane}", "in" if incoming else "out",
+                vec = "from_dsp" if direction == "tx" else "to_dsp"
+                slots = min(width, max(0, dsp["slots_used"] - width * lane))
+                pin(f"dsp{n}_{direction}_data{lane}", "in" if direction == "tx" else "out",
                     (ball, resource), f"{vec}({len(used[direction])})")
-                slots = min(16, max(0, dsp["slots_used"] - 16 * lane))
-                used[direction].append((dsp["first_id"] + 16 * lane) * 64 + slots if slots else 0)
+                used[direction].append(((dsp["first_id"] + width * lane) * 64 + slots) if slots else 0)
                 owners[direction].append(i)
 
+    for name, (mode, ball, resource, signal) in PORT_B.items():
+        # Profile 0 retains the exact same physical clock and stimulus pads.
+        if not count and mode == "out" and name != "phy_b_ref":
+            signal = "'0'"
+        if not count and mode == "in":
+            signal = name + "_unused"
+        pin(name, mode, (ball, resource), signal)
+
     lanes = max(map(len, used.values()))
-
-    def packed(values, width):
-        return '"' + ''.join(f'{n:0{width}b}' for n in reversed(values + [0] * (lanes - len(values)))) + '"'
-
-    descriptors = [packed(values[direction], width)
-                   for values, width in ((used, 15), (owners, 2)) for direction in ("tx", "rx")]
+    packs = []
+    for direction in ("tx", "rx"):
+        packs.extend('"' + ''.join(f'{v:0{width}b}' for v in reversed(seq + [0] * (lanes - len(seq)))) + '"'
+                     for seq, width in ((used[direction], 15), (owners[direction], 2)))
     for lane in range(len(used["tx"]), lanes):
         assignments.append(f"    from_dsp({lane}) <= '0';")
+
+    taps = []
+    for i in range(1, count):
+        assignments.extend((f"    dv({i}) <= stimulus({i * 4});",
+                            f"    rxd({i * 2 + 1} downto {i * 2}) <= stimulus({i * 4 + 2} downto {i * 4 + 1});",
+                            f"    sync_a_rx({i}) <= stimulus({i * 4 + 3});",
+                            f"    sync_b_rx({i}) <= stimulus({i * 4 + 4});"))
+        taps.extend(f"{signal}({i})" for signal in ("txen", "phy_reset", "sync_a_tx", "sync_a_de", "sync_b_tx", "sync_b_de"))
+        taps.extend(f"txd({bit})" for bit in (2*i, 2*i+1))
+    if taps:
+        assignments.append("""    process(clk_rmii)
+    begin
+        if rising_edge(clk_rmii) then
+            stimulus <= stimulus(14 downto 0) & (stimulus(15) xor stimulus(13) xor phy_b_dv xor phy_b_rxd0);
+            observed <= """ + " xor ".join(taps) + ";\n        end if;\n    end process;")
 
     ports = []
     for name, (mode, _, _) in pins.items():
         ports.extend(("host_miso_out : out std_logic", "host_miso_oe : out std_logic", "host_miso_in : in std_logic")
                      if mode == "inout" else (f"{name} : {mode} std_logic",))
-    (out / "wing_fpga.vhd").write_text(f"""-- SPDX-License-Identifier: GPL-3.0-only
-library ieee;
+    (out / "wing_fpga.vhd").write_text(f"""library ieee;
 use ieee.std_logic_1164.all;
 entity wing_fpga is
     port ({'; '.join(ports)});
 end entity;
 architecture rtl of wing_fpga is
-    signal clkin, bclk : std_logic;
+    signal bclk, clkin : std_logic;
     signal dpi_miso, dpi_sel, dpi_sck, dpi_mosi, reset_n, fs : std_logic_vector(3 downto 0);
     signal from_dsp, to_dsp : std_logic_vector({lanes - 1} downto 0);
+    signal dv, txen, phy_reset, sync_a_tx, sync_a_de, sync_b_tx, sync_b_de : std_logic_vector({count - 1} downto 0);
+    signal sync_a_rx, sync_b_rx : std_logic_vector({count - 1} downto 0);
+    signal rxd, txd : std_logic_vector({2*count - 1} downto 0);
+    signal stimulus : std_logic_vector(15 downto 0) := x"19C1";
+    signal observed : std_logic := '0';
+    signal phy_b_dv_unused, phy_b_rxd0_unused, phy_b_rxd1_unused : std_logic;
+    signal sync_b_a_observe_unused, sync_b_b_observe_unused : std_logic;
 begin
     console : entity work.wing_common
-        generic map ({lanes}, {', '.join(descriptors)})
-        port map (clk_audio, host_sck, host_mosi, ctrl_cs_n, dsp_cs_n,
-                  host_miso_out, host_miso_oe, clkin, dpi_miso, dpi_sel, dpi_sck, dpi_mosi, reset_n,
-                  bclk, fs, from_dsp, to_dsp);
+        generic map ({count}, {lanes}, {packs[0]}, {packs[2]}, {packs[1]}, {packs[3]})
+        port map (clk_audio, clk_rmii, host_sck, host_mosi, ctrl_cs_n, dsp_cs_n,
+                  host_miso_out, host_miso_oe, bclk, clkin, dpi_miso, dpi_sel, dpi_sck, dpi_mosi,
+                  reset_n, fs, from_dsp, to_dsp, dv, sync_a_rx, sync_b_rx, rxd,
+                  txen, phy_reset, sync_a_tx, sync_a_de, sync_b_tx, sync_b_de, txd, observed);
 {chr(10).join(assignments)}
 end architecture;
 """)
@@ -170,28 +202,60 @@ def emit_efinity(out, pins, sources):
     write_xml(out, NAME + ".xml", project)
 
 
-def generate(out):
-    profile = PROFILE.read_bytes()
-    if hashlib.sha256(profile).hexdigest() != PROFILE_SHA256:
-        raise ValueError("WING profile does not match the shared FPGA/DSP TDM16 contract")
-    sources = [ROOT / "rtl/core/tdm_frame_io.vhd", ROOT / "consoles/wing/dsp_spi.vhd", ROOT / "consoles/wing/wing_common.vhd"]
-    sdc = HERE / "wing.sdc"
-    digest = hashlib.sha256()
-    for source in [Path(__file__), PROFILE, sdc, *sources,
-                   *(ROOT / "litex_soc" / name for name in ("generate.py", "spi_bone.py", "requirements.txt"))]:
-        digest.update(hashlib.sha256(source.read_bytes()).digest())
+def generate(out, count):
+    aes_rtl = ROOT / "rtl/aes50/rtl"
+    if (not (aes_rtl / "aes50_core.vhd").exists() or subprocess.check_output(
+            ["git", "-C", str(aes_rtl.parent), "rev-parse", "HEAD"], text=True).strip() != AES50_REV):
+        raise ValueError(f"initialize the pinned rtl/aes50 submodule ({AES50_REV})")
+    subprocess.run(["git", "-C", str(aes_rtl.parent), "diff", "--exit-code", "HEAD", "--", "rtl"], check=True)
     out.mkdir(parents=True, exist_ok=False)
-    build("wing", str(out), int.from_bytes(digest.digest()[:4], "big"))
-    pins = emit_top(out, json.loads(profile))
-    (out / "dsp_board_profile.json").write_bytes(profile)
-    for source in [*sources, sdc]:
+    build("wing", str(out), count)
+    pins = emit_top(out, json.loads((out / "dsp_board_profile.json").read_text()), count)
+    sources = [*(aes_rtl / (n + ".vhd") for n in (
+        "aes50_pkg", "aes50_dpram", "aes50_fifo", "aes50_uart", "aes50_aux_uart_enc", "aes50_aux_uart_dec",
+        "aes50_clk_audio", "aes50_link_ctrl", "aes50_tx_framer", "aes50_rx_deframer", "aes50_tdm_serdes", "aes50_core")),
+        *(ROOT / f"rtl/core/{n}.vhd" for n in ("audioclk", "audiomatrix_ram", "audiomatrix_ram_read", "audiomatrix_ram_write",
+           "tdm_multichan_rx", "tdm_multichan_tx", "routing_wb", "tdm_frame_io", "openaudio_core")),
+        ROOT / "consoles/wing/dsp_spi.vhd", ROOT / "consoles/wing/wing_common.vhd"]
+    for source in sources:
         shutil.copyfile(source, out / source.name)
+    subprocess.run(["patch", "--batch", "--forward", "--fuzz=0", "-p2", "-i",
+                    str(Path(__file__).with_name("aes50-wing-cdc.patch"))], cwd=out, check=True)
     names = [source.name for source in sources] + ["wing_fpga.vhd", "gateware/openaudio_soc.v"]
     emit_efinity(out, pins, names)
     (out / "sources.txt").write_text("\n".join(names) + "\n")
+    sdc = Path(__file__).with_name("wing.sdc").read_text()
+    if count:
+        sdc += "\n" + Path(__file__).with_name("aes50.sdc").read_text()
+    (out / "wing.sdc").write_text(sdc)
+
+
+def bind(out):
+    manifest = json.loads((out / "manifest.unbound.json").read_text())
+    if manifest["benchmark_only"]:
+        raise ValueError("benchmark profiles cannot be bound for the loader")
+    if manifest.get("dsp_board_profile_sha256") != sha256(BOARD_PROFILE):
+        raise ValueError("refusing a different or retired DSP board profile")
+    path = out / "outflow" / manifest["bitstream"]["file"]
+    raw = path.read_bytes()
+    header = raw[:256].splitlines()
+    if any(i not in header for i in (b"Family: Trion", b"Device: T55F484", b"Width: 1", b"Mode: passive")) or raw[256:260] != bytes.fromhex("168a2236"):
+        raise ValueError("not a native T55F484 passive x1 image with intact preamble")
+    for name, digest in {**manifest["csr_sha256"], "dsp_board_profile.json": manifest["dsp_board_profile_sha256"]}.items():
+        if sha256(out / name) != digest:
+            raise ValueError(f"input digest changed: {name}")
+    manifest["bitstream"].update(sha256=sha256(path), size_bytes=len(raw))
+    shutil.copyfile(path, out / path.name)
+    (out / "manifest.candidate.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    generate(parser.parse_args().output.resolve())
+    parser.add_argument("--aes50-ports", type=int, choices=range(4), default=1)
+    parser.add_argument("--bind", action="store_true")
+    args = parser.parse_args()
+    if args.bind:
+        bind(args.output.resolve())
+    else:
+        generate(args.output.resolve(), args.aes50_ports)

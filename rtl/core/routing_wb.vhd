@@ -34,7 +34,8 @@ use ieee.numeric_std.all;
 entity routing_wb is
 	generic (
 		G_AW			: natural := 8;		-- log2 of the destinations, also the source width
-		G_WIN_AW		: natural := 14		-- word address bits of the bus window (64 KiB)
+		G_WIN_AW		: natural := 14;		-- word address bits of the bus window (64 KiB)
+		G_FRAME_ROUTES : natural := 0		-- nonzero: synchronous frame-locked routing
 	);
 	port (
 		-- Wishbone slave
@@ -52,7 +53,9 @@ entity routing_wb is
 		-- matrix: source of the destination channel_idx, one clock latency
 		mtx_clk_i		: in  std_logic;
 		mtx_channel_i	: in  std_logic_vector(G_AW - 1 downto 0);
-		mtx_source_o	: out std_logic_vector(G_AW - 1 downto 0)
+		mtx_source_o	: out std_logic_vector(G_AW - 1 downto 0);
+		frame_reset_i, frame_read_i : in std_logic := '0';
+		frame_ready_o : out std_logic
 	);
 end entity routing_wb;
 
@@ -66,6 +69,8 @@ architecture rtl of routing_wb is
 	signal rd_data	: std_logic_vector(G_AW - 1 downto 0);
 	signal rd_valid	: std_logic;
 begin
+	legacy : if G_FRAME_ROUTES = 0 generate
+	frame_ready_o <= '1';
 	wb_addr <= unsigned(wb_adr_i(G_AW - 1 downto 0));
 	in_range <= '1' when unsigned(wb_adr_i(G_WIN_AW - 1 downto G_AW)) = 0 else '0';
 
@@ -96,4 +101,48 @@ begin
 			mtx_source_o <= ram(to_integer(unsigned(mtx_channel_i)));
 		end if;
 	end process;
+	end generate;
+
+	-- Both accesses use wb_clk_i here. The scan owns the matrix read port
+	-- until the last selector is latched; host reads can continue, writes wait.
+	frame_locked : if G_FRAME_ROUTES > 0 generate
+		type route_ram_t is array (0 to 2**G_AW - 1) of std_logic_vector(G_AW - 1 downto 0);
+		signal routes : route_ram_t;
+		signal clear_idx : natural range 0 to G_FRAME_ROUTES := 0;
+		signal request, legal, write_en, ready, err : std_logic := '0';
+		signal addr : unsigned(G_AW - 1 downto 0);
+		signal data : std_logic_vector(G_AW - 1 downto 0);
+	begin
+		assert G_FRAME_ROUTES < 2**G_AW severity failure;
+		ready <= '1' when clear_idx = G_FRAME_ROUTES and frame_reset_i = '0' else '0';
+		frame_ready_o <= ready;
+		request <= wb_cyc_i and wb_stb_i and not (ack or err);
+		legal <= '1' when unsigned(wb_adr_i(G_WIN_AW - 1 downto 0)) < G_FRAME_ROUTES and
+			(wb_we_i = '0' or (wb_sel_i = "1111" and unsigned(wb_dat_i) <= G_FRAME_ROUTES)) else '0';
+		write_en <= '1' when ready = '0' or
+			(request = '1' and legal = '1' and wb_we_i = '1' and frame_read_i = '0') else '0';
+		addr <= to_unsigned(clear_idx, G_AW) when ready = '0' else unsigned(wb_adr_i(G_AW - 1 downto 0));
+		data <= (others => '0') when ready = '0' else wb_dat_i(G_AW - 1 downto 0);
+
+		process(wb_clk_i)
+		begin
+			if rising_edge(wb_clk_i) then
+				if write_en = '1' then routes(to_integer(addr)) <= data; end if;
+				rd_data <= routes(to_integer(addr));
+				if frame_read_i = '1' then mtx_source_o <= routes(to_integer(unsigned(mtx_channel_i))); end if;
+				ack <= '0'; err <= '0';
+				if frame_reset_i = '1' then
+					clear_idx <= 0;
+				elsif clear_idx < G_FRAME_ROUTES then
+					clear_idx <= clear_idx + 1;
+				elsif request = '1' then
+					if legal = '0' then err <= '1';
+					elsif wb_we_i = '0' or frame_read_i = '0' then ack <= '1'; end if;
+				end if;
+			end if;
+		end process;
+		wb_ack_o <= ack;
+		wb_err_o <= err;
+		wb_dat_o <= std_logic_vector(resize(unsigned(rd_data), 32));
+	end generate;
 end architecture rtl;

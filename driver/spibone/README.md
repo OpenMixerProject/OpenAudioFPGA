@@ -56,6 +56,26 @@ fpga@0 {
 The child `reg` is a Wishbone window: it cannot be translated through the SPI bus,
 so the bus driver creates the client devices itself and the clients read `reg`.
 
+### WING: configuration and control use different chip selects
+
+Set `compatible = "openmixer,wing-spibone"`, `reg = <1>` and
+`spi-max-frequency = <2000000>` on ECSPI2, with an active-low **GPIO** CS1 (V6
+at the FPGA), SPI mode 0, MSB first, eight bits. Do not set `litex,online-at-probe`
+or attach Wishbone children. A sole bound instance is `/dev/spibone0`; the node
+may exist before configuration, but ordinary transactions then return `ENODEV`.
+The driver does not request PROG_B or CDONE. The existing loader owns those
+lines and programs the native passive x1 image on SS0 with `SPI_NO_CS`.
+
+Before a reconfiguration, invalidate the trusted receipt and set the control
+device offline. After checking the installed image/CSR/profile digests, loading
+the image and checking CDONE, the privileged loader calls
+`SPIBONE_IOC_WING_ENABLE` (`_IOW(0xB5, 8, __u32)`) with the manifest BUILD_ID.
+The driver checks WING magic, ABI 2, production capability mask, BUILD_ID and
+ready before moving online. It rejects CONFIG, RAW and generic ONLINE on this
+compatible. Before each physical WING write it rechecks BUILD_ID and ready;
+loss of either revokes access. Use the trusted manifest for allowed endpoint
+IDs and the routing and CSR addresses; the old Recovery ABI is not this ABI.
+
 ## Build
 
 ```sh
@@ -67,6 +87,10 @@ Client drivers built out of tree link against its symbols
 (`KBUILD_EXTRA_SYMBOLS=<this directory>/Module.symvers`) and include `spibone.h`.
 OpenX32 builds the driver into its kernel (`files/spibone/build.sh`, always) and
 `aes67_eth` on top of it (`files/aes67/build.sh kernel`, with AES67).
+For an in-tree build, source this directory's `Kconfig`, recurse into it from
+the kernel parent Makefile when `CONFIG_SPIBONE` is selected, and install
+`spibone_uapi.h` alongside the userspace build inputs. Linux 6.6 uses
+`<asm/unaligned.h>`; newer trees use `<linux/unaligned.h>`.
 
 This driver came from the AES67 project (`driver/spibone`); OpenAudioFPGA is its
 home now, the AES67 copy is still there until that project is switched over.

@@ -50,6 +50,7 @@ from litex.soc.interconnect import wishbone
 from litex.soc.interconnect.csr import CSRStatus, CSRStorage, CSRField
 
 from spi_bone import SPIBone
+from wing_contract import WING_ABI, WING_MAGIC, capabilities, export_wing, source_digest
 
 
 SYS_CLK_FREQ = 50e6     # the RMII clock of the X32 (clk_50m_i of x32_common)
@@ -92,6 +93,12 @@ _io = [
         Subsignal("version", Pins(32)),
         Subsignal("config",  Pins(8)),
     ),
+    ("wing", 0,
+        Subsignal("status", Pins(32)),
+        Subsignal("reset_release", Pins(4)),
+        Subsignal("audio_enable", Pins(4)),
+        Subsignal("audio_valid", Pins(4)),
+    ),
 ] + [_wb_pads(f"{name}_wb") for name, _, _ in WB_SLAVES]
 
 
@@ -133,16 +140,7 @@ class WingStub(GenericPlatform):
     default_clk_period = 1e9 / 49.152e6
 
     def __init__(self):
-        GenericPlatform.__init__(self, "T55F484", _io[:2] + [
-            ("wing", 0,
-                Subsignal("ready", Pins(1)),
-                Subsignal("reset_release", Pins(4)),
-                Subsignal("audio_enable", Pins(4)),
-                Subsignal("audio_valid", Pins(4)),
-                Subsignal("sport_slot", Pins(9)),
-                Subsignal("sport_send", Pins(32)),
-                Subsignal("sport_return", Pins(32))),
-        ])
+        GenericPlatform.__init__(self, "T55F484", _io)
 
     def build(self, fragment, **kwargs):
         return _stub_build(self, fragment, **kwargs)
@@ -199,7 +197,7 @@ class CoreCSRs(LiteXModule):
 
 
 class WingCSRs(LiteXModule):
-    def __init__(self, pads, build_id):
+    def __init__(self, pads, build_id, aes50_ports):
         self.magic = CSRStatus(32, name="magic")
         self.abi_version = CSRStatus(32, name="abi_version")
         self.build_id = CSRStatus(32, name="build_id")
@@ -208,19 +206,13 @@ class WingCSRs(LiteXModule):
         self.dsp_reset_release = CSRStorage(4, name="dsp_reset_release")
         self.dsp_audio_enable = CSRStorage(4, name="dsp_audio_enable")
         self.dsp_audio_valid = CSRStorage(4, name="dsp_audio_valid")
-        self.sport_slot = CSRStorage(9, reset=511, name="sport_slot")
-        self.sport_send = CSRStorage(32, name="sport_send")
-        self.sport_return = CSRStatus(32, name="sport_return")
         self.comb += [
-            self.magic.status.eq(0x57494E47), self.abi_version.status.eq(0x00020000),
-            self.build_id.status.eq(build_id), self.capabilities.status.eq(0),
-            self.status.status.eq(pads.ready),
+            self.magic.status.eq(WING_MAGIC), self.abi_version.status.eq(WING_ABI),
+            self.build_id.status.eq(build_id), self.capabilities.status.eq(capabilities(aes50_ports)),
+            self.status.status.eq(pads.status),
             pads.reset_release.eq(self.dsp_reset_release.storage & 0b1011),
             pads.audio_enable.eq(self.dsp_audio_enable.storage),
             pads.audio_valid.eq(self.dsp_audio_valid.storage),
-            pads.sport_slot.eq(self.sport_slot.storage),
-            pads.sport_send.eq(self.sport_send.storage),
-            self.sport_return.status.eq(pads.sport_return),
         ]
 
 
@@ -253,7 +245,7 @@ def _wire_master_to_pads(soc, iface, pads):
 # -- SoC -----------------------------------------------------------------------------
 
 class OpenAudioSoC(SoCCore):
-    def __init__(self, platform, sys_clk_freq=SYS_CLK_FREQ, wing_build_id=None):
+    def __init__(self, platform, sys_clk_freq=SYS_CLK_FREQ, wing_build_id=None, aes50_ports=1):
         SoCCore.__init__(self, platform, sys_clk_freq,
             cpu_type                 = "None",
             # one master: the shared interconnect, which (unlike the crossbar) has the bus
@@ -276,15 +268,18 @@ class OpenAudioSoC(SoCCore):
 
         # SPI -> Wishbone master. MISO is a plain output (no tristate): the X32 tops
         # drive the MISO pin themselves, with the chip select.
-        self.spibone = SPIBone(platform.request("spibone"), with_burst=True, with_tristate=False)
+        self.spibone = SPIBone(platform.request("spibone"), with_burst=True, with_tristate=False,
+            safe_routing=wing_build_id is not None)
         self.bus.add_master(name="spibone", master=self.spibone.bus)
 
+        self.core = CoreCSRs(platform.request("core"))
+        wing_pads = platform.request("wing")
         if wing_build_id is not None:
             self.csr.add("wing", n=3)
-            self.wing = WingCSRs(platform.request("wing"), wing_build_id)
-            return
-
-        self.core = CoreCSRs(platform.request("core"))
+            self.wing = WingCSRs(wing_pads, wing_build_id, aes50_ports)
+        else:
+            # Common HDL interface; no WING CSR bank or behavior on X32.
+            self.comb += [p.eq(0) for p in (wing_pads.reset_release, wing_pads.audio_enable, wing_pads.audio_valid)]
 
         for name, origin, size in WB_SLAVES:
             iface = wishbone.Interface(data_width=32, adr_width=30)
@@ -295,9 +290,11 @@ class OpenAudioSoC(SoCCore):
 
 # -- main ----------------------------------------------------------------------------
 
-def build(family, output_dir, wing_build_id=None):
+def build(family, output_dir, aes50_ports=1):
     platform = PLATFORMS[family]()
-    soc = OpenAudioSoC(platform, 49.152e6 if family == "wing" else SYS_CLK_FREQ, wing_build_id)
+    digest = source_digest(aes50_ports) if family == "wing" else None
+    soc = OpenAudioSoC(platform, 49.152e6 if digest else SYS_CLK_FREQ,
+                      int(digest[:8], 16) if digest else None, aes50_ports)
     builder = Builder(soc,
         output_dir       = output_dir,
         compile_software = False,
@@ -306,12 +303,14 @@ def build(family, output_dir, wing_build_id=None):
         csr_csv          = os.path.join(output_dir, "csr.csv"),
     )
     builder.build(build_name="openaudio_soc", run=False)
+    if digest:
+        export_wing(output_dir, digest, aes50_ports)
     print(f"{family}: {output_dir}/gateware/openaudio_soc.v, {output_dir}/csr.csv")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Generate the OpenAudioFPGA control SoC (SPIBone + Wishbone)")
-    parser.add_argument("--family", default="all", choices=["lattice", "xilinx", "all"])
+    parser.add_argument("--family", default="all", choices=[*PLATFORMS, "all"])
     parser.add_argument("--output-dir", default=None, help="output directory (single family only)")
     args = parser.parse_args()
 

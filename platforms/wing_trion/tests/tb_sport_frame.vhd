@@ -1,4 +1,3 @@
--- SPDX-License-Identifier: GPL-3.0-only
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;

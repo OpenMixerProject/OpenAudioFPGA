@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+config SPIBONE
+	tristate "LiteX SPIBone bridge"
+	depends on SPI
+	help
+	  Access a LiteX Wishbone bus over SPI, using the spibone character
+	  device or kernel clients. Includes the identity-gated WING transport.

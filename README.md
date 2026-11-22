@@ -108,3 +108,43 @@ By hand:
   in `platforms/x32_lattice`.
 * Xilinx: `xtclsh create_project.tcl` in `platforms/x32_spartan` creates `build/x32_spartan.xise`,
   `xtclsh create_project.tcl build` also builds the bit file.
+
+## WING Trion T55F484 (offline candidate)
+
+The WING console uses the fork's shared core, routing RAM, LiteX SPIBone SoC and
+AES50v2 `rtl/aes50` Gitlink (`bffe14e91636efe0c873adfc8244731d610f9e1c`).
+The WING generator applies [its CDC patch](platforms/wing_trion/aes50-wing-cdc.patch)
+to staged AES50v2 sources only. The upstream Gitlink and GPL-3.0-or-later
+headers remain intact; X32 continues to use the unpatched submodule.
+After `git submodule update --init` and setting up the pinned LiteX Python environment:
+
+```sh
+litex_soc/.venv/bin/python platforms/wing_trion/generate.py build/wing-b --aes50-ports 1
+```
+
+Compile the generated `wing-fpga.xml` with Efinity 2026.1.132 (`efx_run --flow
+compile`, seed 1). `--aes50-ports 0`, `2` and `3` are non-deliverable measurement
+profiles of the same design. Extra cores have synthetic RMII/sync stimulus and a
+CSR-observable output reduction, not A/C pads. The B profile alone selects a
+production-shaped CSR capability mask. That mask does not qualify the board.
+See the [B-only CDC and timing audit](platforms/wing_trion/tests/cdc.md) for
+offline verification and the remaining WING V1 measurement gates.
+
+Manual clock targets: Si5351 CLK0/R2 **49.152 MHz**, CLK5/M3 **50.000 MHz**;
+FPGA-generated DSP CLKIN 12.288 MHz, SPORT BCLK 24.576 MHz and FS 48 kHz.
+The byte-exact `consoles/wing/profile-tdm16.json` defines stock pin directions,
+separate in-phase TX/RX BCLK/FS, and slots 64/50/32/16. `profile.json` is the
+**retired offline-only** TDM32 profile: 49.152 MHz SPORT violates the SHARC
+slave-TX limit. The old Recovery images are not hardware audio profiles either.
+No DSP FS/VALID until the actual clock source, DSP PLL/CCLK, speed grade, framing,
+and both I/O directions have been qualified. T6/R7 are read-only observations;
+the B sync net roles and live link are not proved. W9 resets A and B together.
+
+`csr.csv`, `csr.json`, and `software/include/generated/csr.h` come from the
+same LiteX generation as the image. `--bind build/wing-b` (output directory
+first or last) verifies the native passive-x1 preamble and digests and produces
+`manifest.candidate.json`; it does not create a trusted loader receipt. Boot
+the image only under a separately qualified loader policy. ABI 2 has routing
+base `0x80000000` (not the Recovery `0x1000`), 768 10-bit words, and OFF=0;
+only IDs in `channels.sources` / `channels.destinations` are available.
+See [SPIBone driver](driver/spibone/README.md) for SS0 vs SS1 and online checks.

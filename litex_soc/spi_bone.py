@@ -157,7 +157,7 @@ class SPIBone(LiteXModule, ModuleDoc):
     at the bridge's sys/4 rate); burst read is self-paced and tolerates any
     read latency by emitting more ``MISO``-high padding.
     """
-    def __init__(self, pads, wires=4, with_tristate=True, with_burst=True):
+    def __init__(self, pads, wires=4, with_tristate=True, with_burst=True, safe_routing=False):
         self.bus = bus = wishbone.Interface(address_width=32, data_width=32, addressing="word")
 
         # # #
@@ -336,6 +336,15 @@ class SPIBone(LiteXModule, ModuleDoc):
                 NextState("BUS-MMAP-READ"),
             )
 
+        if safe_routing:
+            # A frame-locked routing write may take more than one SPI bit.
+            # Only single-word writes can wait without dropping MOSI bits.
+            address_done = If((address[:2] != 0) | (burst & write & (address[16:] == 0x8000)),
+                NextState("REJECT"),
+            ).Else(address_done)
+        fsm.act("REJECT", miso_en.eq(1), NextValue(miso, 1))
+        error = bus.err if safe_routing else 0
+
         fsm.act("GET-ADDRESS",
             miso_en.eq(0),
             If(count == (32 + 8),
@@ -361,7 +370,7 @@ class SPIBone(LiteXModule, ModuleDoc):
             bus.we.eq(1),
             bus.cyc.eq(1),
             miso_en.eq(1),
-            If(bus.ack | bus.err,
+            If(error, NextState("REJECT")).Elif(bus.ack | bus.err,
                 NextState("WAIT-BYTE-BOUNDARY")
             )
         )
@@ -371,7 +380,7 @@ class SPIBone(LiteXModule, ModuleDoc):
             bus.we.eq(0),
             bus.cyc.eq(1),
             miso_en.eq(1),
-            If(bus.ack | bus.err,
+            If(error, NextState("REJECT")).Elif(bus.ack | bus.err,
                 NextState("WAIT-BYTE-BOUNDARY"),
                 NextValue(data, bus.dat_r)
             )
@@ -502,7 +511,7 @@ class SPIBone(LiteXModule, ModuleDoc):
                 bus.stb.eq(1),
                 bus.we.eq(1),
                 bus.cyc.eq(1),
-                If(bus.ack | bus.err,
+                If(error, NextState("REJECT")).Elif(bus.ack | bus.err,
                     NextValue(address, address + 4),
                     If(blen == 1,
                         NextState("WAIT-BYTE-BOUNDARY"),

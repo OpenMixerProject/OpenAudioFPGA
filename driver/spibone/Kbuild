@@ -1,3 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-# Out-of-tree build of the LiteX SPIBone bus driver.
+ifneq ($(KBUILD_EXTMOD),)
 obj-m += spibone.o
+else
+obj-$(CONFIG_SPIBONE) += spibone.o
+endif

@@ -36,6 +36,7 @@
  *       };
  *   };
  */
+#include <linux/capability.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/idr.h>
@@ -49,7 +50,11 @@
 #include <linux/spi/spi.h>
 #include <linux/spi/spidev.h>
 #include <linux/uaccess.h>
+#if __has_include(<linux/unaligned.h>)
 #include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
 #include <linux/vmalloc.h>
 
 #include "spibone.h"
@@ -59,6 +64,18 @@
 #define CMD_READ		0x01
 #define CMD_BURST_WRITE		0x02
 #define CMD_BURST_READ		0x03
+
+/* Stable WING bootstrap ABI; verified against the generated LiteX CSR map. */
+#define WING_MAGIC_CSR		0x1800u
+#define WING_ABI_CSR		0x1804u
+#define WING_BUILD_ID_CSR	0x1808u
+#define WING_CAPS_CSR		0x180cu
+#define WING_STATUS_CSR		0x1810u
+#define WING_RESET_CSR		0x1814u
+#define WING_AUDIO_ENABLE_CSR	0x1818u
+#define WING_AUDIO_VALID_CSR	0x181cu
+#define WING_ROUTE_BASE		0x80000000u
+#define WING_ROUTES		768u
 
 /* 0xff padding clocked out to capture the variable-latency response */
 #define RESPONSE_SLACK		24
@@ -93,6 +110,8 @@ struct spibone {
 	/* state changes (taken before bus_lock, never inside it) */
 	struct mutex		 state_lock;
 	u32			 state;
+	bool			 wing;
+	u32			 wing_build_id;
 	struct list_head	 children;
 	/* DMA-safe scratch for bursts, guarded by bus_lock */
 	u8			*tx;
@@ -119,7 +138,7 @@ static int spibone_xfer(struct spibone *sb, const u8 *tx, u8 *rx, size_t len)
 		.tx_buf		= tx,
 		.rx_buf		= rx,
 		.len		= len,
-		.speed_hz	= spi_hz,	/* 0: spi-max-frequency */
+		.speed_hz	= sb->wing ? min(spi_hz, sb->spi->max_speed_hz) : spi_hz,
 	};
 	struct spi_message m;
 
@@ -164,26 +183,24 @@ bool spibone_online(struct spibone *sb)
 }
 EXPORT_SYMBOL_GPL(spibone_online);
 
-int spibone_read_locked(struct spibone *sb, u32 addr, u32 *val)
+static int spibone_read_word(struct spibone *sb, u32 addr, u32 *val)
 {
-	u8 tx[5 + RESPONSE_SLACK];
-	u8 rx[5 + RESPONSE_SLACK];
+	u8 *tx = sb->tx, *rx = sb->rx;
+	const int len = 5 + RESPONSE_SLACK;
 	int ret, i;
 
 	lockdep_assert_held(&sb->bus_lock);
-	if (!spibone_online(sb))
-		return -ENODEV;
 
 	tx[0] = CMD_READ;
 	put_unaligned_be32(addr, &tx[1]);
 	memset(&tx[5], 0xff, RESPONSE_SLACK);
 
-	ret = spibone_xfer(sb, tx, rx, sizeof(tx));
+	ret = spibone_xfer(sb, tx, rx, len);
 	if (ret)
 		return ret;
 
 	/* skip the 0xff the bridge drives while the read is in flight */
-	for (i = 5; i + 4 < (int)sizeof(rx); i++) {
+	for (i = 5; i + 4 < len; i++) {
 		if (rx[i] == CMD_READ) {
 			*val = get_unaligned_be32(&rx[i + 1]);
 			return 0;
@@ -193,28 +210,71 @@ int spibone_read_locked(struct spibone *sb, u32 addr, u32 *val)
 	}
 	return -ETIMEDOUT;
 }
+
+int spibone_read_locked(struct spibone *sb, u32 addr, u32 *val)
+{
+	lockdep_assert_held(&sb->bus_lock);
+	if (!spibone_online(sb))
+		return -ENODEV;
+	return spibone_read_word(sb, addr, val);
+}
 EXPORT_SYMBOL_GPL(spibone_read_locked);
+
+static int wing_check_csr(struct spibone *sb, u32 addr, u32 expected, u32 mask)
+{
+	u32 value;
+	int ret = spibone_read_word(sb, addr, &value);
+
+	if (ret)
+		return ret;
+	return (value & mask) == expected ? 0 : -ESTALE;
+}
+
+static int wing_check_live(struct spibone *sb, u32 build_id)
+{
+	int ret = wing_check_csr(sb, WING_BUILD_ID_CSR, build_id, ~0u);
+
+	if (!ret)
+		ret = wing_check_csr(sb, WING_STATUS_CSR, 1, 1);
+	return ret;
+}
 
 int spibone_write_locked(struct spibone *sb, u32 addr, u32 val)
 {
-	u8 tx[9 + RESPONSE_SLACK];
-	u8 rx[9 + RESPONSE_SLACK];
+	u8 *tx = sb->tx, *rx = sb->rx;
+	const int len = 9 + RESPONSE_SLACK;
 	int ret, i;
 
 	lockdep_assert_held(&sb->bus_lock);
 	if (!spibone_online(sb))
 		return -ENODEV;
+	if (sb->wing) {
+		if (addr >= WING_ROUTE_BASE && addr < WING_ROUTE_BASE + 4 * WING_ROUTES) {
+			if ((addr & 3) || val > WING_ROUTES)
+				return -EINVAL;
+		} else if (addr != WING_RESET_CSR && addr != WING_AUDIO_ENABLE_CSR && addr != WING_AUDIO_VALID_CSR) {
+			return -EACCES;
+		} else if (val & ~(addr == WING_RESET_CSR ? 11u : 15u)) {
+			return -EINVAL;
+		}
+		ret = wing_check_live(sb, sb->wing_build_id);
+		if (ret) {
+			/* WING has no client children; revoke under the transaction lock. */
+			WRITE_ONCE(sb->state, SPIBONE_STATE_OFFLINE);
+			return ret;
+		}
+	}
 
 	tx[0] = CMD_WRITE;
 	put_unaligned_be32(addr, &tx[1]);
 	put_unaligned_be32(val, &tx[5]);
 	memset(&tx[9], 0xff, RESPONSE_SLACK);
 
-	ret = spibone_xfer(sb, tx, rx, sizeof(tx));
+	ret = spibone_xfer(sb, tx, rx, len);
 	if (ret)
 		return ret;
 
-	for (i = 9; i < (int)sizeof(rx); i++) {
+	for (i = 9; i < len; i++) {
 		if (rx[i] == CMD_WRITE)
 			return 0;
 		if (rx[i] != 0xff)
@@ -252,10 +312,18 @@ int spibone_burst_write_locked(struct spibone *sb, u32 addr, const u32 *words, u
 	if (!spibone_online(sb))
 		return -ENODEV;
 
-	if (!use_burst) {
+	if (!use_burst || sb->wing) {
 		unsigned int i;
 		int ret;
 
+		if (sb->wing) {
+			if ((addr & 3) || addr < WING_ROUTE_BASE || addr >= WING_ROUTE_BASE + 4 * WING_ROUTES ||
+			    n > (WING_ROUTE_BASE + 4 * WING_ROUTES - addr) / 4)
+				return -EINVAL;
+			for (i = 0; i < n; i++)
+				if (words[i] > WING_ROUTES)
+					return -EINVAL;
+		}
 		for (i = 0; i < n; i++) {
 			ret = spibone_write_locked(sb, addr + 4 * i, words[i]);
 			if (ret)
@@ -409,6 +477,8 @@ static int spibone_set_state(struct spibone *sb, u32 state)
 
 	if (state > SPIBONE_STATE_ONLINE)
 		return -EINVAL;
+	if (sb->wing && state != SPIBONE_STATE_OFFLINE)
+		return -EPERM;
 	if (state == old)
 		return 0;
 
@@ -424,6 +494,35 @@ static int spibone_set_state(struct spibone *sb, u32 state)
 
 	dev_info(&sb->spi->dev, "bus %s\n", state_names[state]);
 	return 0;
+}
+
+static int spibone_wing_enable(struct spibone *sb, u32 build_id)
+{
+	int ret = -EBUSY;
+
+	if (!sb->wing)
+		return -EOPNOTSUPP;
+	if (!capable(CAP_SYS_RAWIO))
+		return -EPERM;
+	mutex_lock(&sb->state_lock);
+	mutex_lock(&sb->bus_lock);
+	if (sb->state != SPIBONE_STATE_OFFLINE)
+		goto unlock;
+	ret = wing_check_csr(sb, WING_MAGIC_CSR, 0x57494e47u, ~0u);
+	if (!ret)
+		ret = wing_check_csr(sb, WING_ABI_CSR, 0x00020000u, ~0u);
+	if (!ret)
+		ret = wing_check_csr(sb, WING_CAPS_CSR, 0x0fu, ~0u);
+	if (!ret)
+		ret = wing_check_live(sb, build_id);
+	if (!ret) {
+		sb->wing_build_id = build_id;
+		WRITE_ONCE(sb->state, SPIBONE_STATE_ONLINE);
+	}
+unlock:
+	mutex_unlock(&sb->bus_lock);
+	mutex_unlock(&sb->state_lock);
+	return ret;
 }
 
 /* --- raw SPI messages (FPGA configuration) --------------------------------------- */
@@ -598,6 +697,8 @@ static long spibone_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		return put_user(state, (u32 __user *)uarg);
 
 	case SPIBONE_IOC_SET_STATE:
+		if (sb->wing && !capable(CAP_SYS_RAWIO))
+			return -EPERM;
 		if (get_user(state, (u32 __user *)uarg))
 			return -EFAULT;
 		mutex_lock(&sb->state_lock);
@@ -606,9 +707,16 @@ static long spibone_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		return ret;
 
 	case SPIBONE_IOC_RAW_MESSAGE:
+		if (sb->wing)
+			return -EPERM;
 		if (copy_from_user(&rm, uarg, sizeof(rm)))
 			return -EFAULT;
 		return spibone_raw_message(sb, &rm);
+
+	case SPIBONE_IOC_WING_ENABLE:
+		if (get_user(state, (u32 __user *)uarg))
+			return -EFAULT;
+		return spibone_wing_enable(sb, state);
 
 	default:
 		return -ENOTTY;
@@ -659,11 +767,17 @@ static int spibone_probe(struct spi_device *spi)
 	struct device *dev = &spi->dev;
 	struct spibone *sb;
 	int ret;
+	u32 cs;
 
 	sb = devm_kzalloc(dev, sizeof(*sb), GFP_KERNEL);
 	if (!sb)
 		return -ENOMEM;
 	sb->spi = spi;
+	sb->wing = of_device_is_compatible(dev->of_node, "openmixer,wing-spibone");
+	if (sb->wing && (of_property_read_u32(dev->of_node, "reg", &cs) || cs != 1 ||
+			 !spi->max_speed_hz || spi->max_speed_hz > 2000000 ||
+			 !spi_get_csgpiod(spi, 0) || (spi->mode & (SPI_CS_HIGH | SPI_NO_CS | SPI_LSB_FIRST))))
+		return dev_err_probe(dev, -EINVAL, "WING requires active-low GPIO CS1, MSB first, at most 2 MHz\n");
 	mutex_init(&sb->bus_lock);
 	mutex_init(&sb->state_lock);
 	INIT_LIST_HEAD(&sb->children);
@@ -698,7 +812,7 @@ static int spibone_probe(struct spi_device *spi)
 
 	dev_info(dev, "/dev/%s, %u Hz\n", sb->name, spi_hz ? spi_hz : spi->max_speed_hz);
 
-	if (of_property_read_bool(dev->of_node, "litex,online-at-probe")) {
+	if (!sb->wing && of_property_read_bool(dev->of_node, "litex,online-at-probe")) {
 		mutex_lock(&sb->state_lock);
 		spibone_set_state(sb, SPIBONE_STATE_ONLINE);
 		mutex_unlock(&sb->state_lock);
@@ -719,6 +833,7 @@ static void spibone_remove(struct spi_device *spi)
 
 static const struct of_device_id spibone_of_match[] = {
 	{ .compatible = "litex,spibone" },
+	{ .compatible = "openmixer,wing-spibone" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, spibone_of_match);
@@ -726,6 +841,7 @@ MODULE_DEVICE_TABLE(of, spibone_of_match);
 /* the SPI core matches the modalias: the DT compatible without the vendor prefix */
 static const struct spi_device_id spibone_spi_ids[] = {
 	{ "spibone" },
+	{ "wing-spibone" },
 	{ }
 };
 MODULE_DEVICE_TABLE(spi, spibone_spi_ids);
