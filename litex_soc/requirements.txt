@@ -1,0 +1,5 @@
+# LiteX environment of the control SoC generator (litex_soc/generate.py).
+# Pinned to the versions the gateware was generated and tested with; install with
+# litex_soc/setup_venv.sh. Only migen and LiteX itself are needed (no CPU, no software).
+migen @ git+https://github.com/m-labs/migen.git@4c2ae8dfeea37f235b52acb8166f12acaaae4f7c
+litex @ git+https://github.com/enjoy-digital/litex.git@9d46dff95956aff97e124e4997b0bb60be6951cb
