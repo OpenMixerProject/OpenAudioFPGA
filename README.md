@@ -2,6 +2,9 @@
 
 Modular FPGA code base for the consoles of the [OpenMixerProject](https://github.com/OpenMixerProject).
 
+## Bugs and Ideas
+
+Please report Bugs or submit Ideas in our zentral [Ticketsystem](https://github.com/OpenMixerProject/Ticketsystem/issues)
 
 ## Layers
 
