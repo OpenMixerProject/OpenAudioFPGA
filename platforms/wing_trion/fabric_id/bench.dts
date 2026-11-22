@@ -1,0 +1,36 @@
+/* Reuse the passive USB/UART topology; add only the configuration link. */
+#include "wing-t55-diag.dts"
+#include <dt-bindings/gpio/gpio.h>
+#include "imx6dl-wing-t55-bringup.dtsi"
+#include "imx6dl-wing-t55-spibone.dtsi"
+
+/ {
+	model = "Behringer WING Compact T55 (Fabric Identity Bench)";
+};
+
+&ecspi2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_ecspi2 &pinctrl_t55_cs &pinctrl_fpga_ctrl>;
+	/delete-node/ dsp@0;
+	config@0 {
+		compatible = "rohm,dh2228fv"; /* only passive SPI_NO_CS, by the bound loader */
+		reg = <0>;
+		spi-max-frequency = <2000000>;
+	};
+};
+
+&iomuxc {
+	pinctrl_ecspi2: ecspi2grp {
+		fsl,pins = <
+			MX6QDL_PAD_EIM_CS0__ECSPI2_SCLK 0x1b0b0
+			MX6QDL_PAD_EIM_CS1__ECSPI2_MOSI 0x1b0b0
+			MX6QDL_PAD_EIM_OE__ECSPI2_MISO 0x1b0b0
+		>;
+	};
+	pinctrl_fpga_ctrl: fpgactrlgrp {
+		fsl,pins = <
+			MX6QDL_PAD_EIM_A21__GPIO2_IO17 0x1b0b0 /* CRESET_N */
+			MX6QDL_PAD_DISP0_DAT5__GPIO4_IO26 0x4001b008 /* CDONE */
+		>;
+	};
+};

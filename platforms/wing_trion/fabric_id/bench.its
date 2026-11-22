@@ -1,0 +1,32 @@
+/dts-v1/;
+/ {
+    description = "WING Compact: manual T55 fabric identity bench, RAM only";
+    #address-cells = <1>;
+    images {
+        kernel {
+            description = "ARM Linux";
+            data = /incbin/("zImage");
+            type = "kernel"; arch = "arm"; os = "linux"; compression = "none";
+            load = <0x12000000>; entry = <0x12000000>;
+            hash-1 { algo = "crc32"; };
+        };
+        fdt {
+            description = "WING Compact fabric identity DTB";
+            data = /incbin/("bench.dtb");
+            type = "flat_dt"; arch = "arm"; compression = "none";
+            load = <0x13000000>;
+            hash-1 { algo = "crc32"; };
+        };
+        ramdisk {
+            description = "Manual identity tool and bound volatile fabric";
+            data = /incbin/("initramfs.cpio.gz");
+            type = "ramdisk"; arch = "arm"; os = "linux"; compression = "none";
+            load = <0x13800000>;
+            hash-1 { algo = "crc32"; };
+        };
+    };
+    configurations {
+        default = "wing";
+        wing { description = "Manual identity only"; kernel = "kernel"; fdt = "fdt"; ramdisk = "ramdisk"; };
+    };
+};

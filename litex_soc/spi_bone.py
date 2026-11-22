@@ -157,7 +157,8 @@ class SPIBone(LiteXModule, ModuleDoc):
     at the bridge's sys/4 rate); burst read is self-paced and tolerates any
     read latency by emitting more ``MISO``-high padding.
     """
-    def __init__(self, pads, wires=4, with_tristate=True, with_burst=True, safe_routing=False):
+    def __init__(self, pads, wires=4, with_tristate=True, with_burst=True, safe_routing=False,
+                 read_only=False):
         self.bus = bus = wishbone.Interface(address_width=32, data_width=32, addressing="word")
 
         # # #
@@ -279,7 +280,12 @@ class SPIBone(LiteXModule, ModuleDoc):
         #   0x00 single write   0x01 single read
         #   0x02 burst  write   0x03 burst  read   (only when with_burst)
         # Burst commands set `burst` so GET-ADDRESS collects a word count next.
-        if with_burst:
+        if read_only:
+            if with_burst:
+                raise ValueError("read-only SPIBone only supports single-word reads")
+            self.comb += write.eq(0)
+            command_decode = If(command == 1, NextState("GET-ADDRESS")).Else(NextState("END"))
+        elif with_burst:
             command_decode = If(command == 0,
                 NextValue(write, 1),
                 NextValue(burst, 0),

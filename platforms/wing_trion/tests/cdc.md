@@ -32,6 +32,8 @@ independent 49.152/50 MHz clocks and asynchronous sync stimulus, real TDM
 and RMII framing with CRC, a changing word for every channel/sample, and
 reset during traffic. SPORT and Wishbone cover word edges, frame mute,
 selector/range semantics, scan arbitration and startup clearing.
+The SS0 bench checks the DSP selector. The separate Verilator `tb_ss1.v`
+bench checks the generated B-only SoC's identity, readiness and reset mask.
 
 In Efinity 2026.1.132 run `efx_run wing-fpga.xml --flow compile` on the staged
 T55F484 project (C4, seed 1), then `efx_run --flow sta_tclsh --tcl_script
@@ -43,7 +45,11 @@ generated clock declared on `CLKBUF__2|O`. Verify the driver is
 outputs and forwarded clocks intentionally have no external I/O delay;
 they are not board-qualified by this audit.
 
-### Routed B-only result (build ID `0x2bcf0718`)
+### Historical routed B-only result (build ID `0x2bcf0718`)
+
+This result predates the separate fabric-identity target. The shared SPIBone
+source is part of the B build digest, so regenerate and bind the current image;
+do not reuse the historical manifest, build ID or bitstream hash.
 
 | Check | Efinity 2026.1.132 (ns) |
 | --- | ---: |
@@ -62,6 +68,13 @@ unconstrained internal data endpoints. The full reports include the pad
 reference clock arrival and the per-bit bundle bounds. The interface/pin
 plan and DSP profile are byte-identical to the pre-fix stock candidate;
 the 210 source and 210 destination IDs are unchanged.
+
+### Routed B-only build with fabric-ID sources present (`0xc013b1ac`)
+
+Efinity 2026.1.132 (C4, seed 1) reported worst setup/hold of
++0.978/+0.119 ns, TX/RX descriptor setup of +3.021/+40.895 ns, and zero
+unconstrained internal data endpoints. These are results for this build ID
+under the provisional pad budgets, not hardware qualification.
 
 ## Physical gates (not part of digital signoff)
 

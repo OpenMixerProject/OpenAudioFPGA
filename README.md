@@ -148,3 +148,6 @@ the image only under a separately qualified loader policy. ABI 2 has routing
 base `0x80000000` (not the Recovery `0x1000`), 768 10-bit words, and OFF=0;
 only IDs in `channels.sources` / `channels.destinations` are available.
 See [SPIBone driver](driver/spibone/README.md) for SS0 vs SS1 and online checks.
+
+For offline identity-only checks, see the [separate fabric-ID target](platforms/wing_trion/fabric_id/README.md).
+It does not instantiate the mixer, SPORT, or AES50 and is not a substitute for the Port B image.

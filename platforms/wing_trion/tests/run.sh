@@ -11,10 +11,10 @@ while IFS= read -r source; do
     if [[ $source == *.vhd ]]; then sources+=("$stage/$source"); fi
 done < "$stage/sources.txt"
 ghdl -a --std=08 -frelaxed "${sources[@]}" "$test_dir"/tb_*.vhd
-for bench in tb_routing_wb tb_sport_frame; do
-    ghdl -r --std=08 -frelaxed "$bench" --assert-level=error --ieee-asserts=disable
+for bench in tb_dsp_spi tb_routing_wb tb_sport_frame; do
+    ghdl --elab-run --std=08 -frelaxed "$bench" --assert-level=error --ieee-asserts=disable
 done
 for phase in 3 11 17; do
-    ghdl -r --std=08 -frelaxed tb_aes50_b_cdc -gG_RMII_PHASE_NS="$phase" \
+    ghdl --elab-run --std=08 -frelaxed tb_aes50_b_cdc -gG_RMII_PHASE_NS="$phase" \
         --assert-level=error --ieee-asserts=disable
 done

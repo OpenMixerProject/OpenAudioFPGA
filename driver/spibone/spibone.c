@@ -512,7 +512,11 @@ static int spibone_wing_enable(struct spibone *sb, u32 build_id)
 	if (!ret)
 		ret = wing_check_csr(sb, WING_ABI_CSR, 0x00020000u, ~0u);
 	if (!ret)
+#ifdef WING_FABRIC_ID_ONLY
+		ret = wing_check_csr(sb, WING_CAPS_CSR, 0u, ~0u);
+#else
 		ret = wing_check_csr(sb, WING_CAPS_CSR, 0x0fu, ~0u);
+#endif
 	if (!ret)
 		ret = wing_check_live(sb, build_id);
 	if (!ret) {
@@ -674,10 +678,20 @@ static long spibone_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	u32 state;
 	int ret;
 
+#ifdef WING_FABRIC_ID_ONLY
+	/* Separate bench kernel: no raw, burst or register-write ioctls. */
+	if (cmd != SPIBONE_IOC_PEEK && cmd != SPIBONE_IOC_WING_ENABLE &&
+	    cmd != SPIBONE_IOC_SET_STATE && cmd != SPIBONE_IOC_GET_STATE)
+		return -EOPNOTSUPP;
+#endif
 	switch (cmd) {
 	case SPIBONE_IOC_PEEK:
 		if (copy_from_user(&x, uarg, sizeof(x)))
 			return -EFAULT;
+#ifdef WING_FABRIC_ID_ONLY
+		if ((x.addr & 3) || x.addr < WING_MAGIC_CSR || x.addr > WING_STATUS_CSR)
+			return -EACCES;
+#endif
 		ret = spibone_read(sb, x.addr, &x.val);
 		if (ret)
 			return ret;
@@ -723,9 +737,25 @@ static long spibone_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	}
 }
 
+#ifdef WING_FABRIC_ID_ONLY
+static int spibone_bench_release(struct inode *inode, struct file *f)
+{
+	struct spibone *sb = file_to_sb(f);
+
+	/* Drop read access even if the loader is killed. Do not touch GPIO or SPI. */
+	mutex_lock(&sb->state_lock);
+	spibone_set_state(sb, SPIBONE_STATE_OFFLINE);
+	mutex_unlock(&sb->state_lock);
+	return 0;
+}
+#endif
+
 static const struct file_operations spibone_fops = {
 	.owner		= THIS_MODULE,
 	.unlocked_ioctl	= spibone_ioctl,
+#ifdef WING_FABRIC_ID_ONLY
+	.release	= spibone_bench_release,
+#endif
 	.compat_ioctl	= compat_ptr_ioctl,
 };
 
@@ -774,6 +804,10 @@ static int spibone_probe(struct spi_device *spi)
 		return -ENOMEM;
 	sb->spi = spi;
 	sb->wing = of_device_is_compatible(dev->of_node, "openmixer,wing-spibone");
+#ifdef WING_FABRIC_ID_ONLY
+	if (!sb->wing || of_get_child_count(dev->of_node))
+		return -EINVAL;
+#endif
 	if (sb->wing && (of_property_read_u32(dev->of_node, "reg", &cs) || cs != 1 ||
 			 !spi->max_speed_hz || spi->max_speed_hz > 2000000 ||
 			 !spi_get_csgpiod(spi, 0) || (spi->mode & (SPI_CS_HIGH | SPI_NO_CS | SPI_LSB_FIRST))))
