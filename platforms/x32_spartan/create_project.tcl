@@ -28,6 +28,10 @@ set sources {
 	rtl/aes50/rtl/aes50_rx_deframer.vhd
 	rtl/aes50/rtl/aes50_tdm_serdes.vhd
 	rtl/aes50/rtl/aes50_core.vhd
+	rtl/aes50/rtl/aes50_par_core.vhd
+	rtl/modules/aes50/src_96k_48k.vhd
+	rtl/modules/aes50/aes50_par_bridge.vhd
+	rtl/modules/aes50/aes50_wb.vhd
 	rtl/core/audioclk.vhd
 	rtl/core/audiomatrix_ram.vhd
 	rtl/core/audiomatrix_ram_read.vhd
@@ -42,6 +46,7 @@ set sources {
 	rtl/periph/spi_tx.vhd
 	rtl/periph/spi_16bit_tx.vhd
 	rtl/periph/cs2000cp_config.vhd
+	rtl/periph/cs2000cp_wb.vhd
 	rtl/periph/cs42438_config.vhd
 	rtl/periph/m8000adc_config.vhd
 	rtl/periph/pcm1690dac_config.vhd
@@ -125,6 +130,33 @@ set aes67_sources {
 	ext/AES67/litex_soc/build/aes67_bridge_xilinx/gateware/litex_soc_aes67_bridge.v
 }
 
+# OpenInferno core (optional, mutually exclusive with AES67; requires INFERNO_DIR or ext/openinferno)
+set inferno_sources {
+	rtl/modules/inferno/inferno_wb.vhd
+	rtl/modules/inferno/inferno_port.v
+	ext/openinferno/rtl/aoip_regs.v
+	ext/openinferno/rtl/inferno_regs.v
+	ext/openinferno/rtl/cpu_pktq.v
+	ext/openinferno/rtl/fs_phase.v
+	ext/openinferno/rtl/ptp_clock.v
+	ext/openinferno/rtl/rmii_rx.v
+	ext/openinferno/rtl/rmii_tx.v
+	ext/openinferno/rtl/inferno_tx.v
+	ext/openinferno/rtl/inferno_rx.v
+}
+
+if {[info exists ::env(INFERNO_DIR)]} {
+	set mapped {}
+	foreach f $inferno_sources {
+		if {[string match "ext/openinferno/*" $f]} {
+			lappend mapped [file join $::env(INFERNO_DIR) [string range $f 16 end]]
+		} else {
+			lappend mapped $f
+		}
+	}
+	set inferno_sources $mapped
+}
+
 # the AES67 checkout can be somewhere else (e.g. inside a VM): AES67_DIR=<path>
 if {[info exists ::env(AES67_DIR)]} {
 	set mapped {}
@@ -151,8 +183,11 @@ if {![regexp -nocase {G_AES67\s*:\s*boolean\s*:=\s*(true|false)} $top_vhd -> aes
 	error "create_project.tcl: no default of G_AES67 found in x32_spartan.vhd"
 }
 set with_aes67 [string equal -nocase $aes67_default true]
-if {[lsearch -exact $argv aes67] >= 0}   { set with_aes67 1 }
-if {[lsearch -exact $argv noaes67] >= 0} { set with_aes67 0 }
+set with_inferno 0
+if {[lsearch -exact $argv aes67] >= 0}     { set with_aes67 1; set with_inferno 0 }
+if {[lsearch -exact $argv noaes67] >= 0}   { set with_aes67 0 }
+if {[lsearch -exact $argv inferno] >= 0}   { set with_inferno 1; set with_aes67 0 }
+if {[lsearch -exact $argv noinferno] >= 0} { set with_inferno 0 }
 
 if {$with_aes67} {
 	set missing {}
@@ -190,8 +225,13 @@ if {[file exists x32_spartan.xise]} {
 			xfile add [file join $root $f]
 		}
 	}
+	if {$with_inferno} {
+		foreach f $inferno_sources {
+			xfile add [file join $root $f]
+		}
+	}
 	# always explicit, so that an override of the VHDL default reaches XST
-	project set "Generics, Parameters" "G_AES67=[expr {$with_aes67 ? "true" : "false"}]" -process "Synthesize - XST"
+	project set "Generics, Parameters" "G_AES67=[expr {$with_aes67 ? "true" : "false"}]|G_INFERNO=[expr {$with_inferno ? "true" : "false"}]" -process "Synthesize - XST"
 	project set top "rtl" "x32_spartan"
 
 	# settings of the previous OpenX32 project

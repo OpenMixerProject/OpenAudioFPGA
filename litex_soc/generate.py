@@ -57,7 +57,10 @@ SYS_CLK_FREQ = 50e6     # the RMII clock of the X32 (clk_50m_i of x32_common)
 # Wishbone slaves outside of the SoC: (bus name, byte origin, byte size)
 WB_SLAVES = [
     ("routing", 0x80000000, 0x10000),   # routing matrix, one word per destination
+    ("aes50",   0x81000000, 0x01000),   # modular N-port AES50v2 (0x40 stride per port)
+    ("clkctrl", 0x82000000, 0x01000),   # console clock/PLL peripheral (e.g. CS2000-CP on X32)
     ("aes67",   0x90000000, 0x20000),   # AES67 core (aes67_bridge window)
+    ("inferno", 0xA0000000, 0x10000),   # modular OpenInferno register window
 ]
 
 
@@ -179,6 +182,8 @@ class CoreCSRs(LiteXModule):
             CSRField("tdm_lines_out", size=8, offset=8,  description="TDM8 output lines of the routing matrix (8 destinations each)."),
             CSRField("aes50_ports",   size=4, offset=16, description="Number of AES50 cores."),
             CSRField("aes67",         size=1, offset=20, description="1 = with AES67 core (bus window aes67)."),
+            CSRField("inferno",       size=1, offset=21, description="1 = with OpenInferno core (bus window inferno)."),
+            CSRField("aes50_src",     size=1, offset=22, description="1 = with AES50 parallel bridge + 96k SRC + Wishbone aux."),
             CSRField("platform",      size=8, offset=24, description="Platform: 1 = X32 Lattice ECP5, 2 = X32 Xilinx Spartan-3A."),
         ], description="Build information (VHDL generics).")
         self.version = CSRStatus(32, description="Gateware version (VHDL constant).")
@@ -192,6 +197,8 @@ class CoreCSRs(LiteXModule):
             self.info.fields.tdm_lines_out.eq(pads.info[8:16]),
             self.info.fields.aes50_ports.eq(pads.info[16:20]),
             self.info.fields.aes67.eq(pads.info[20]),
+            self.info.fields.inferno.eq(pads.info[21]),
+            self.info.fields.aes50_src.eq(pads.info[22]),
             self.info.fields.platform.eq(pads.info[24:32]),
             self.version.status.eq(pads.version),
             pads.config.eq(self.config.storage),

@@ -6,6 +6,10 @@ entity x32_common is
 	generic (
 		G_AES50_PORTS			: natural range 0 to 2 := 1;	-- AES50 cores
 		G_AES67					: boolean := false;				-- AES67 core on the port after the AES50 cores
+		G_INFERNO				: boolean := false;				-- OpenInferno core on the port after the AES50 cores
+		G_INFERNO_RXW			: positive := 2048;				-- OpenInferno CPU RX queue words (2048 ECP5, 1024 Spartan-3A)
+		G_AES50_PAR_BRIDGE		: boolean := true;				-- true: aes50_par_bridge (96k SRC + Wishbone aux)
+		G_AES50_SRC				: boolean := true;				-- enable 96<->48 kHz half-band FIR SRC
 		G_EXT_TDM_LINES			: natural := 0;					-- additional TDM lines for the top level
 		-- AUX converters: true = CS42438 codec (boards with the Spartan-3A),
 		--                 false = M8000 ADC + PCM1690 DAC (boards with the ECP5)
@@ -24,8 +28,9 @@ entity x32_common is
 		online_o			: out std_logic;	-- '1' after the startup sequence
 
 		-- CS2000 PLL
-		pll_in_o			: out std_logic;	-- 24.576 MHz from aes67
+		pll_in_o			: out std_logic;	-- 16 MHz / AES67 24.576 MHz / AES50 recovered clock
 		pll_out_i			: in  std_logic;	-- 1024fs
+		pll_aux_i			: in  std_logic := '1';	-- CS2000-CP PLL_LOCK status input
 		pll_ncs_o			: out std_logic;
 		pll_cclk_o			: out std_logic;
 		pll_cdata_o			: out std_logic;
@@ -121,14 +126,16 @@ architecture rtl of x32_common is
 	constant C_AES67_LINE	: natural := C_BASE_LINES + 6 * G_AES50_PORTS;
 	constant C_AES67_PORT	: natural := G_AES50_PORTS;			-- network port of the AES67 core
 
-	function f_aes67_lines return natural is
+	function f_portb_lines return natural is
 	begin
 		if G_AES67 then
 			return 4;
+		elsif G_INFERNO then
+			return 6;
 		end if;
 		return 0;
 	end function;
-	constant C_EXT_LINE		: natural := C_AES67_LINE + f_aes67_lines;
+	constant C_EXT_LINE		: natural := C_AES67_LINE + f_portb_lines;
 	constant C_LINES		: natural := C_EXT_LINE + G_EXT_TDM_LINES;
 
 	-- AES50 system mode of every core: "10"
@@ -172,6 +179,25 @@ architecture rtl of x32_common is
 	signal c67_rmii_tx_en	: std_logic;
 	signal c67_rmii_txd		: std_logic_vector(1 downto 0);
 	signal c67_pll_ref		: std_logic;
+	signal cinf_rmii_crs_dv	: std_logic := '0';
+	signal cinf_rmii_rxd	: std_logic_vector(1 downto 0) := "00";
+	signal cinf_rmii_tx_en	: std_logic;
+	signal cinf_rmii_txd	: std_logic_vector(1 downto 0);
+
+	signal clk_src			: std_logic_vector(2 downto 0);
+	signal aes50_clk_to_pll	: std_logic_vector(G_AES50_PORTS - 1 downto 0);
+	signal pll_in_default	: std_logic;
+
+	-- Wishbone clock/PLL peripheral bus (0x82000000 -> u_cs2000)
+	signal clkctrl_wb_adr	: std_logic_vector(29 downto 0);
+	signal clkctrl_wb_dat_w	: std_logic_vector(31 downto 0);
+	signal clkctrl_wb_dat_r	: std_logic_vector(31 downto 0);
+	signal clkctrl_wb_sel	: std_logic_vector(3 downto 0);
+	signal clkctrl_wb_cyc	: std_logic;
+	signal clkctrl_wb_stb	: std_logic;
+	signal clkctrl_wb_we	: std_logic;
+	signal clkctrl_wb_ack	: std_logic;
+	signal clkctrl_wb_err	: std_logic;
 
 	signal pll_rst			: std_logic;
 	signal rst				: std_logic;
@@ -187,17 +213,13 @@ architecture rtl of x32_common is
 	signal tdm_out			: std_logic_vector(C_LINES - 1 downto 0);
 	signal tdm_par			: std_logic_vector(C_LINES * 24 - 1 downto 0);
 
-	signal pll_start		: std_logic;
-	signal pll_busy			: std_logic;
-	signal pll_address		: std_logic_vector(7 downto 0);
-	signal pll_data			: std_logic_vector(7 downto 0);
-	signal pll_map			: std_logic_vector(7 downto 0);
-
 	type t_ultranet_ch is array (1 to 8) of std_logic_vector(23 downto 0);
 	signal p16_a_ch			: t_ultranet_ch;
 	signal p16_b_ch			: t_ultranet_ch;
 begin
-	assert not G_AES67 or G_AES50_PORTS <= 1
+	assert not (G_AES67 and G_INFERNO)
+		report "x32_common: G_AES67 and G_INFERNO are mutually exclusive" severity failure;
+	assert (not G_AES67 and not G_INFERNO) or G_AES50_PORTS <= 1
 		report "x32_common: the X32 has two network ports" severity failure;
 
 	------------------------------------------------------------------------
@@ -225,31 +247,30 @@ begin
 			rst_o => aes50_rst);
 
 	------------------------------------------------------------------------
-	-- CS2000 audio PLL
+	-- CS2000 audio PLL (standalone Wishbone peripheral at 0x82000000)
 	------------------------------------------------------------------------
-	u_pll_config : entity work.cs2000cp_config
+	u_cs2000 : entity work.cs2000cp_wb
 		generic map (
 			G_RATIO => C_PLL_RATIO)
 		port map (
-			clk => clk_16m_i,
-			i_start => pll_rst,
-			i_txbusy => pll_busy,
-			o_address => pll_address,
-			o_map => pll_map,
-			o_data => pll_data,
-			o_start => pll_start);
-
-	u_pll_spi : entity work.spi_tx
-		port map (
-			clk => clk_16m_i,
-			i_address => pll_address,
-			i_map => pll_map,
-			i_data => pll_data,
-			i_start => pll_start,
-			o_nCS => pll_ncs_o,
-			o_cclk => pll_cclk_o,
-			o_cdata => pll_cdata_o,
-			o_busy => pll_busy);
+			wb_clk_i    => clk_50m_i,
+			wb_rst_i    => aes50_rst,
+			wb_adr_i    => clkctrl_wb_adr,
+			wb_dat_i    => clkctrl_wb_dat_w,
+			wb_dat_o    => clkctrl_wb_dat_r,
+			wb_sel_i    => clkctrl_wb_sel,
+			wb_cyc_i    => clkctrl_wb_cyc,
+			wb_stb_i    => clkctrl_wb_stb,
+			wb_we_i     => clkctrl_wb_we,
+			wb_ack_o    => clkctrl_wb_ack,
+			wb_err_o    => clkctrl_wb_err,
+			clk_16m_i   => clk_16m_i,
+			pll_rst_i   => pll_rst,
+			pll_aux_i   => pll_aux_i,
+			pll_ncs_o   => pll_ncs_o,
+			pll_cclk_o  => pll_cclk_o,
+			pll_cdata_o => pll_cdata_o,
+			clk_src_o   => clk_src);
 
 	------------------------------------------------------------------------
 	-- AUX converters
@@ -420,8 +441,13 @@ begin
 			G_AES50_UART_FIFO_AW => 11,
 			G_AES50_UART_BAUD => 115200,
 			G_AES50_SIM_ASSM_SAMPLES => G_AES50_SIM_ASSM_SAMPLES,
+			G_AES50_PAR_BRIDGE => G_AES50_PAR_BRIDGE,
+			G_AES50_ENABLE_SRC => G_AES50_SRC,
 			G_AES67 => G_AES67,
 			G_AES67_FIRST_LINE => C_AES67_LINE,
+			G_INFERNO => G_INFERNO,
+			G_INFERNO_FIRST_LINE => C_AES67_LINE,
+			G_INFERNO_RXW => G_INFERNO_RXW,
 			G_PLATFORM_ID => G_PLATFORM_ID)
 		port map (
 			clk_fs1024_i => pll_out_i,
@@ -465,7 +491,23 @@ begin
 			aes67_rmii_tx_en_o => c67_rmii_tx_en,
 			aes67_rmii_txd_o => c67_rmii_txd,
 			aes67_irq_o => open,
-			aes67_pll_ref_o => c67_pll_ref);
+			aes67_pll_ref_o => c67_pll_ref,
+			pll_lock_i => pll_aux_i,
+			aes50_clk_to_pll_o => aes50_clk_to_pll,
+			clkctrl_wb_adr_o => clkctrl_wb_adr,
+			clkctrl_wb_dat_o => clkctrl_wb_dat_w,
+			clkctrl_wb_dat_i => clkctrl_wb_dat_r,
+			clkctrl_wb_sel_o => clkctrl_wb_sel,
+			clkctrl_wb_cyc_o => clkctrl_wb_cyc,
+			clkctrl_wb_stb_o => clkctrl_wb_stb,
+			clkctrl_wb_we_o => clkctrl_wb_we,
+			clkctrl_wb_ack_i => clkctrl_wb_ack,
+			clkctrl_wb_err_i => clkctrl_wb_err,
+			inferno_rst_i => aes50_rst,
+			inferno_rmii_crs_dv_i => cinf_rmii_crs_dv,
+			inferno_rmii_rxd_i => cinf_rmii_rxd,
+			inferno_rmii_tx_en_o => cinf_rmii_tx_en,
+			inferno_rmii_txd_o => cinf_rmii_txd);
 
 	------------------------------------------------------------------------
 	-- network
@@ -495,7 +537,15 @@ begin
 			phy_rst_n_o(p) <= online;
 		end generate;
 
-		gen_unused : if p >= G_AES50_PORTS and not (G_AES67 and p = C_AES67_PORT) generate
+		gen_inferno : if G_INFERNO and p = C_AES67_PORT generate
+			cinf_rmii_crs_dv <= rmii_crs_dv_i(p);
+			cinf_rmii_rxd <= rmii_rxd_i(2 * p + 1 downto 2 * p);
+			rmii_tx_en_o(p) <= cinf_rmii_tx_en;
+			rmii_txd_o(2 * p + 1 downto 2 * p) <= cinf_rmii_txd;
+			phy_rst_n_o(p) <= online;
+		end generate;
+
+		gen_unused : if p >= G_AES50_PORTS and not ((G_AES67 or G_INFERNO) and p = C_AES67_PORT) generate
 			rmii_tx_en_o(p) <= '0';
 			rmii_txd_o(2 * p + 1 downto 2 * p) <= "00";
 			phy_rst_n_o(p) <= online;
@@ -529,13 +579,31 @@ begin
 		uart4_rxd_o <= '1';
 	end generate;
 
-	-- AES67: the core is the clock master (its NCO is the reference of the audio PLL)
+	-- Clock reference mux for CS2000-CP PLL:
+	--   clk_src = "001": AES50 A recovered clock (if present)
+	--   clk_src = "010": AES50 B recovered clock (if present)
+	--   clk_src = "000": AES67 PTP NCO (if G_AES67) else internal 16 MHz oscillator
 	gen_aes67_clk : if G_AES67 generate
-		pll_in_o <= c67_pll_ref;
+		pll_in_default <= c67_pll_ref;
 	end generate;
 
 	gen_no_aes67_clk : if not G_AES67 generate
-		pll_in_o <= clk_16m_i;
+		pll_in_default <= clk_16m_i;
+	end generate;
+
+	gen_pll_in_2 : if G_AES50_PORTS >= 2 generate
+		pll_in_o <= aes50_clk_to_pll(0) when clk_src = "001" else
+		            aes50_clk_to_pll(1) when clk_src = "010" else
+		            pll_in_default;
+	end generate;
+
+	gen_pll_in_1 : if G_AES50_PORTS = 1 generate
+		pll_in_o <= aes50_clk_to_pll(0) when clk_src = "001" else
+		            pll_in_default;
+	end generate;
+
+	gen_pll_in_0 : if G_AES50_PORTS = 0 generate
+		pll_in_o <= pll_in_default;
 	end generate;
 
 	clk_fs512_o <= clk_fs512;

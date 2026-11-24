@@ -4,7 +4,8 @@ use ieee.std_logic_1164.all;
 entity x32_lattice is
 	generic (
 		G_AES50_PORTS	: natural range 0 to 2 := 1;
-		G_AES67			: boolean := true				-- AES67 core on the port after the AES50 cores
+		G_AES67			: boolean := true;				-- AES67 core on the port after the AES50 cores
+		G_INFERNO		: boolean := false				-- OpenInferno core on Port B (mutually exclusive with G_AES67)
 	);
 	port (
 		fpgaclk					: in  std_logic;	-- 16 MHz
@@ -359,6 +360,8 @@ begin
 		generic map (
 			G_AES50_PORTS => G_AES50_PORTS,
 			G_AES67 => G_AES67,
+			G_INFERNO => G_INFERNO,
+			G_INFERNO_RXW => 2048,
 			G_EXT_TDM_LINES => 0,
 			G_AUX_CS42438 => false,
 			G_AES50_SUPPORT_44K1 => false,
@@ -372,6 +375,7 @@ begin
 			online_o => open,
 			pll_in_o => PLL_IN,
 			pll_out_i => PLL_OUT,
+			pll_aux_i => PLL_AUX,
 			pll_ncs_o => PLL_nCS,
 			pll_cclk_o => PLL_CCLK,
 			pll_cdata_o => PLL_CDATA,

@@ -42,6 +42,18 @@
         <Source name="../../rtl/aes50/rtl/aes50_core.vhd" type="VHDL" type_short="VHDL">
             <Options/>
         </Source>
+        <Source name="../../rtl/aes50/rtl/aes50_par_core.vhd" type="VHDL" type_short="VHDL">
+            <Options/>
+        </Source>
+        <Source name="../../rtl/modules/aes50/src_96k_48k.vhd" type="VHDL" type_short="VHDL">
+            <Options/>
+        </Source>
+        <Source name="../../rtl/modules/aes50/aes50_par_bridge.vhd" type="VHDL" type_short="VHDL">
+            <Options/>
+        </Source>
+        <Source name="../../rtl/modules/aes50/aes50_wb.vhd" type="VHDL" type_short="VHDL">
+            <Options/>
+        </Source>
         <Source name="../../rtl/core/audioclk.vhd" type="VHDL" type_short="VHDL">
             <Options/>
         </Source>
@@ -79,6 +91,9 @@
             <Options/>
         </Source>
         <Source name="../../rtl/periph/cs2000cp_config.vhd" type="VHDL" type_short="VHDL">
+            <Options/>
+        </Source>
+        <Source name="../../rtl/periph/cs2000cp_wb.vhd" type="VHDL" type_short="VHDL">
             <Options/>
         </Source>
         <Source name="../../rtl/periph/cs42438_config.vhd" type="VHDL" type_short="VHDL">

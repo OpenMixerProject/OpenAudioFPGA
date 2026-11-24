@@ -77,15 +77,23 @@ entity openaudio_core is
 		G_AES50_PORTS			: natural := 1;			-- number of AES50 cores (0 = none)
 		G_AES50_FIRST_LINE		: natural := 14;		-- first TDM line of AES50 core 0
 		G_AES50_SUPPORT_44K1	: boolean := false;		-- false: half-size sample RAMs, 48k only
-		G_AES50_UART_AUX		: boolean := true;		-- aux channel over UART
-		G_AES50_TDM_AUX			: boolean := true;		-- aux channel over the 7th TDM line
+		G_AES50_UART_AUX		: boolean := true;		-- aux channel over UART (legacy mode)
+		G_AES50_TDM_AUX			: boolean := true;		-- aux channel over the 7th TDM line (legacy mode)
 		G_AES50_UART_FIFO_AW	: natural := 11;		-- UART FIFOs: 2**n - 1 bytes
 		G_AES50_UART_BAUD		: positive := 115200;	-- baudrate of the aux UARTs
 		G_AES50_SIM_ASSM_SAMPLES	: natural := 2048;	-- simulation only: shorter ASSM period
+		G_AES50_PAR_BRIDGE		: boolean := true;		-- true: modular aes50_wb (96k SRC + Wishbone aux), false: legacy aes50_core
+		G_AES50_ENABLE_SRC		: boolean := true;		-- 96<->48 kHz half-band FIR SRC on AES50 ports
+		G_AES50_AUX_FIFO_AW		: natural := 10;		-- Wishbone aux TX/RX FIFO depth (2**n - 1 bytes)
 
 		-- AES67
 		G_AES67					: boolean := false;		-- with AES67 core
 		G_AES67_FIRST_LINE		: natural := 20;		-- first of its 4 TDM lines
+
+		-- OpenInferno (mutually exclusive with G_AES67)
+		G_INFERNO				: boolean := false;		-- with OpenInferno core (48 ch, 1 ms)
+		G_INFERNO_FIRST_LINE	: natural := 20;		-- first of its 6 TDM lines
+		G_INFERNO_RXW			: positive := 2048;		-- CPU RX queue words (2048 ECP5, 1024 Spartan-3A)
 
 		-- identification (CSR core_info)
 		G_PLATFORM_ID			: natural range 0 to 255 := 0;	-- 1 = X32 Lattice, 2 = X32 Spartan
@@ -155,7 +163,29 @@ entity openaudio_core is
 		aes67_rmii_txd_o	: out std_logic_vector(1 downto 0);
 		aes67_irq_o			: out std_logic;
 		-- PTP disciplined 512 fs clock: reference for the audio PLL that generates clk_fs1024_i
-		aes67_pll_ref_o		: out std_logic
+		aes67_pll_ref_o		: out std_logic;
+
+		-- Audio PLL lock input & AES50 recovered clocks (console clock mux)
+		pll_lock_i			: in  std_logic := '1';
+		aes50_clk_to_pll_o	: out std_logic_vector(G_AES50_PORTS - 1 downto 0);
+
+		-- Console clock/PLL Wishbone slave port (0x82000000, e.g. cs2000cp_wb on X32)
+		clkctrl_wb_adr_o	: out std_logic_vector(29 downto 0);
+		clkctrl_wb_dat_o	: out std_logic_vector(31 downto 0);
+		clkctrl_wb_dat_i	: in  std_logic_vector(31 downto 0) := (others => '0');
+		clkctrl_wb_sel_o	: out std_logic_vector(3 downto 0);
+		clkctrl_wb_cyc_o	: out std_logic;
+		clkctrl_wb_stb_o	: out std_logic;
+		clkctrl_wb_we_o		: out std_logic;
+		clkctrl_wb_ack_i	: in  std_logic := '0';
+		clkctrl_wb_err_i	: in  std_logic := '1';
+
+		-- OpenInferno (unused without G_INFERNO, outputs are '0' then)
+		inferno_rst_i		: in  std_logic := '1';
+		inferno_rmii_crs_dv_i	: in  std_logic := '0';
+		inferno_rmii_rxd_i	: in  std_logic_vector(1 downto 0) := (others => '0');
+		inferno_rmii_tx_en_o	: out std_logic;
+		inferno_rmii_txd_o	: out std_logic_vector(1 downto 0)
 	);
 end entity openaudio_core;
 
@@ -164,9 +194,10 @@ architecture rtl of openaudio_core is
 	-- channel numbers of the matrix (destinations and sources + 1)
 	constant C_ADDR_WIDTH	: integer := 8;
 	-- CSR core_version: bump when the register map of the control bus changes
-	constant C_VERSION		: std_logic_vector(31 downto 0) := x"00030000";
+	constant C_VERSION		: std_logic_vector(31 downto 0) := x"00040000";
 	constant C_AES50_LINES	: natural := 6;		-- TDM lines per AES50 core (48 channels)
 	constant C_AES67_LINES	: natural := 4;		-- TDM lines of the AES67 core (32 channels)
+	constant C_INFERNO_LINES: natural := 6;		-- TDM lines of the OpenInferno core (48 channels)
 
 	-- timer values of the AES50 cores, counted in clocks of the 50 MHz RMII clock
 	constant C_CLK50_HZ			: natural := 50000000;
@@ -199,8 +230,14 @@ architecture rtl of openaudio_core is
 
 	signal routing_m2s		: t_wb_m2s;
 	signal routing_s2m		: t_wb_s2m;
+	signal aes50_m2s		: t_wb_m2s;
+	signal aes50_s2m		: t_wb_s2m;
+	signal clkctrl_m2s		: t_wb_m2s;
+	signal clkctrl_s2m		: t_wb_s2m;
 	signal aes67_m2s		: t_wb_m2s;
 	signal aes67_s2m		: t_wb_s2m;
+	signal inferno_m2s		: t_wb_m2s;
+	signal inferno_s2m		: t_wb_s2m;
 	signal core_info		: std_logic_vector(31 downto 0);
 	signal soc_miso			: std_logic;
 
@@ -238,6 +275,28 @@ architecture rtl of openaudio_core is
 			routing_wb_bte		: out std_logic_vector(1 downto 0);
 			routing_wb_ack		: in  std_logic;
 			routing_wb_err		: in  std_logic;
+			aes50_wb_adr		: out std_logic_vector(29 downto 0);
+			aes50_wb_dat_w		: out std_logic_vector(31 downto 0);
+			aes50_wb_dat_r		: in  std_logic_vector(31 downto 0);
+			aes50_wb_sel		: out std_logic_vector(3 downto 0);
+			aes50_wb_cyc		: out std_logic;
+			aes50_wb_stb		: out std_logic;
+			aes50_wb_we			: out std_logic;
+			aes50_wb_cti		: out std_logic_vector(2 downto 0);
+			aes50_wb_bte		: out std_logic_vector(1 downto 0);
+			aes50_wb_ack		: in  std_logic;
+			aes50_wb_err		: in  std_logic;
+			clkctrl_wb_adr		: out std_logic_vector(29 downto 0);
+			clkctrl_wb_dat_w	: out std_logic_vector(31 downto 0);
+			clkctrl_wb_dat_r	: in  std_logic_vector(31 downto 0);
+			clkctrl_wb_sel		: out std_logic_vector(3 downto 0);
+			clkctrl_wb_cyc		: out std_logic;
+			clkctrl_wb_stb		: out std_logic;
+			clkctrl_wb_we		: out std_logic;
+			clkctrl_wb_cti		: out std_logic_vector(2 downto 0);
+			clkctrl_wb_bte		: out std_logic_vector(1 downto 0);
+			clkctrl_wb_ack		: in  std_logic;
+			clkctrl_wb_err		: in  std_logic;
 			aes67_wb_adr		: out std_logic_vector(29 downto 0);
 			aes67_wb_dat_w		: out std_logic_vector(31 downto 0);
 			aes67_wb_dat_r		: in  std_logic_vector(31 downto 0);
@@ -248,7 +307,56 @@ architecture rtl of openaudio_core is
 			aes67_wb_cti		: out std_logic_vector(2 downto 0);
 			aes67_wb_bte		: out std_logic_vector(1 downto 0);
 			aes67_wb_ack		: in  std_logic;
-			aes67_wb_err		: in  std_logic);
+			aes67_wb_err		: in  std_logic;
+			inferno_wb_adr		: out std_logic_vector(29 downto 0);
+			inferno_wb_dat_w	: out std_logic_vector(31 downto 0);
+			inferno_wb_dat_r	: in  std_logic_vector(31 downto 0);
+			inferno_wb_sel		: out std_logic_vector(3 downto 0);
+			inferno_wb_cyc		: out std_logic;
+			inferno_wb_stb		: out std_logic;
+			inferno_wb_we		: out std_logic;
+			inferno_wb_cti		: out std_logic_vector(2 downto 0);
+			inferno_wb_bte		: out std_logic_vector(1 downto 0);
+			inferno_wb_ack		: in  std_logic;
+			inferno_wb_err		: in  std_logic);
+	end component;
+
+	-- OpenInferno core (rtl/inferno/inferno_wb.vhd).
+	-- A component, so that the core compiles without OpenInferno Verilog sources if not G_INFERNO.
+	component inferno_wb
+		generic (
+			G_MAX_CH  : integer := 48;
+			G_NTXF    : integer := 16;
+			G_NRXF    : integer := 16;
+			G_MAXFCH  : integer := 32;
+			G_MAX_FPP : integer := 16;
+			G_NR      : integer := 64;
+			G_NF      : integer := 64;
+			G_MAXLAT  : integer := 1;
+			G_TXW     : integer := 512;
+			G_RXW     : integer := 2048
+		);
+		port (
+			clk50_i       : in  std_logic;
+			rst_i         : in  std_logic;
+			bclk_i        : in  std_logic;
+			fsync_i       : in  std_logic;
+			rmii_crs_dv_i : in  std_logic;
+			rmii_rxd_i    : in  std_logic_vector(1 downto 0);
+			rmii_tx_en_o  : out std_logic;
+			rmii_txd_o    : out std_logic_vector(1 downto 0);
+			tdm_i         : in  std_logic_vector(5 downto 0);
+			tdm_o         : out std_logic_vector(5 downto 0);
+			wb_adr_i      : in  std_logic_vector(29 downto 0);
+			wb_dat_i      : in  std_logic_vector(31 downto 0);
+			wb_dat_o      : out std_logic_vector(31 downto 0);
+			wb_sel_i      : in  std_logic_vector(3 downto 0);
+			wb_cyc_i      : in  std_logic;
+			wb_stb_i      : in  std_logic;
+			wb_we_i       : in  std_logic;
+			wb_ack_o      : out std_logic;
+			wb_err_o      : out std_logic
+		);
 	end component;
 
 	-- AES67 core (AES67 repository, FPGA/boards/integration/aes67_openaudiofpga.vhd).
@@ -300,9 +408,30 @@ architecture rtl of openaudio_core is
 		return '0';
 	end function;
 
+	function f_inferno_bit return std_logic is
+	begin
+		if G_INFERNO then
+			return '1';
+		end if;
+		return '0';
+	end function;
+
+	function f_aes50_src_bit return std_logic is
+	begin
+		if G_AES50_PAR_BRIDGE and G_AES50_ENABLE_SRC then
+			return '1';
+		end if;
+		return '0';
+	end function;
+
 	function is_aes67_line(line : natural) return boolean is
 	begin
 		return G_AES67 and (line >= G_AES67_FIRST_LINE) and (line < G_AES67_FIRST_LINE + C_AES67_LINES);
+	end function;
+
+	function is_inferno_line(line : natural) return boolean is
+	begin
+		return G_INFERNO and (line >= G_INFERNO_FIRST_LINE) and (line < G_INFERNO_FIRST_LINE + C_INFERNO_LINES);
 	end function;
 begin
 	-- the matrix needs at least two lines (the RAM writer always handles a second receiver),
@@ -313,6 +442,10 @@ begin
 		report "openaudio_core: too many input lines for 8 bit source numbers (max. 31)" severity failure;
 	assert 8 * G_TDM_LINES_OUT <= 2**C_ADDR_WIDTH - 1
 		report "openaudio_core: too many output lines for 8 bit addresses (max. 31)" severity failure;
+	assert not (G_AES67 and G_INFERNO)
+		report "openaudio_core: G_AES67 and G_INFERNO are mutually exclusive" severity failure;
+	assert not G_AES50_PAR_BRIDGE or G_AES50_PORTS <= 8
+		report "openaudio_core: aes50_wb supports at most 8 AES50 ports" severity failure;
 	assert G_AES50_PORTS = 0 or
 		(G_AES50_FIRST_LINE + C_AES50_LINES * G_AES50_PORTS <= G_TDM_LINES_IN and
 		 G_AES50_FIRST_LINE + C_AES50_LINES * G_AES50_PORTS <= G_TDM_LINES_OUT)
@@ -321,10 +454,18 @@ begin
 		(G_AES67_FIRST_LINE + C_AES67_LINES <= G_TDM_LINES_IN and
 		 G_AES67_FIRST_LINE + C_AES67_LINES <= G_TDM_LINES_OUT)
 		report "openaudio_core: the AES67 lines do not fit into the matrix" severity failure;
+	assert not G_INFERNO or
+		(G_INFERNO_FIRST_LINE + C_INFERNO_LINES <= G_TDM_LINES_IN and
+		 G_INFERNO_FIRST_LINE + C_INFERNO_LINES <= G_TDM_LINES_OUT)
+		report "openaudio_core: the OpenInferno lines do not fit into the matrix" severity failure;
 	assert G_AES50_PORTS = 0 or not G_AES67 or
 		G_AES50_FIRST_LINE + C_AES50_LINES * G_AES50_PORTS <= G_AES67_FIRST_LINE or
 		G_AES67_FIRST_LINE + C_AES67_LINES <= G_AES50_FIRST_LINE
 		report "openaudio_core: the AES50 and AES67 lines overlap" severity failure;
+	assert G_AES50_PORTS = 0 or not G_INFERNO or
+		G_AES50_FIRST_LINE + C_AES50_LINES * G_AES50_PORTS <= G_INFERNO_FIRST_LINE or
+		G_INFERNO_FIRST_LINE + C_INFERNO_LINES <= G_AES50_FIRST_LINE
+		report "openaudio_core: the AES50 and OpenInferno lines overlap" severity failure;
 
 	------------------------------------------------------------------------
 	-- audio clock tree
@@ -360,7 +501,7 @@ begin
 	-- control bus: SPIBone -> Wishbone (clk50_i)
 	------------------------------------------------------------------------
 	core_info <= std_logic_vector(to_unsigned(G_PLATFORM_ID, 8))
-			   & "000" & f_aes67_bit
+			   & '0' & f_aes50_src_bit & f_inferno_bit & f_aes67_bit
 			   & std_logic_vector(to_unsigned(G_AES50_PORTS, 4))
 			   & std_logic_vector(to_unsigned(G_TDM_LINES_OUT, 8))
 			   & std_logic_vector(to_unsigned(G_TDM_LINES_IN, 8));
@@ -386,6 +527,28 @@ begin
 			routing_wb_bte => routing_m2s.bte,
 			routing_wb_ack => routing_s2m.ack,
 			routing_wb_err => routing_s2m.err,
+			aes50_wb_adr => aes50_m2s.adr,
+			aes50_wb_dat_w => aes50_m2s.dat,
+			aes50_wb_dat_r => aes50_s2m.dat,
+			aes50_wb_sel => aes50_m2s.sel,
+			aes50_wb_cyc => aes50_m2s.cyc,
+			aes50_wb_stb => aes50_m2s.stb,
+			aes50_wb_we => aes50_m2s.we,
+			aes50_wb_cti => aes50_m2s.cti,
+			aes50_wb_bte => aes50_m2s.bte,
+			aes50_wb_ack => aes50_s2m.ack,
+			aes50_wb_err => aes50_s2m.err,
+			clkctrl_wb_adr => clkctrl_m2s.adr,
+			clkctrl_wb_dat_w => clkctrl_m2s.dat,
+			clkctrl_wb_dat_r => clkctrl_s2m.dat,
+			clkctrl_wb_sel => clkctrl_m2s.sel,
+			clkctrl_wb_cyc => clkctrl_m2s.cyc,
+			clkctrl_wb_stb => clkctrl_m2s.stb,
+			clkctrl_wb_we => clkctrl_m2s.we,
+			clkctrl_wb_cti => clkctrl_m2s.cti,
+			clkctrl_wb_bte => clkctrl_m2s.bte,
+			clkctrl_wb_ack => clkctrl_s2m.ack,
+			clkctrl_wb_err => clkctrl_s2m.err,
 			aes67_wb_adr => aes67_m2s.adr,
 			aes67_wb_dat_w => aes67_m2s.dat,
 			aes67_wb_dat_r => aes67_s2m.dat,
@@ -396,17 +559,38 @@ begin
 			aes67_wb_cti => aes67_m2s.cti,
 			aes67_wb_bte => aes67_m2s.bte,
 			aes67_wb_ack => aes67_s2m.ack,
-			aes67_wb_err => aes67_s2m.err);
+			aes67_wb_err => aes67_s2m.err,
+			inferno_wb_adr => inferno_m2s.adr,
+			inferno_wb_dat_w => inferno_m2s.dat,
+			inferno_wb_dat_r => inferno_s2m.dat,
+			inferno_wb_sel => inferno_m2s.sel,
+			inferno_wb_cyc => inferno_m2s.cyc,
+			inferno_wb_stb => inferno_m2s.stb,
+			inferno_wb_we => inferno_m2s.we,
+			inferno_wb_cti => inferno_m2s.cti,
+			inferno_wb_bte => inferno_m2s.bte,
+			inferno_wb_ack => inferno_s2m.ack,
+			inferno_wb_err => inferno_s2m.err);
 
 	-- MISO is shared with nothing else: drive it only while selected
 	spi_miso_o <= soc_miso when spi_ncs_i = '0' else '0';
 
+	-- Console clock/PLL Wishbone slave port (0x82000000)
+	clkctrl_wb_adr_o <= clkctrl_m2s.adr;
+	clkctrl_wb_dat_o <= clkctrl_m2s.dat;
+	clkctrl_wb_sel_o <= clkctrl_m2s.sel;
+	clkctrl_wb_cyc_o <= clkctrl_m2s.cyc;
+	clkctrl_wb_stb_o <= clkctrl_m2s.stb;
+	clkctrl_wb_we_o  <= clkctrl_m2s.we;
+	clkctrl_s2m.dat  <= clkctrl_wb_dat_i;
+	clkctrl_s2m.ack  <= clkctrl_wb_ack_i;
+	clkctrl_s2m.err  <= clkctrl_wb_err_i and clkctrl_m2s.cyc and clkctrl_m2s.stb;
 
 	------------------------------------------------------------------------
 	-- TDM8 receivers -> audio RAM -> routing -> TDM8 senders
 	------------------------------------------------------------------------
 	gen_ext_in : for i in 0 to G_TDM_LINES_IN - 1 generate
-		gen_pin : if not is_aes50_line(i) and not is_aes67_line(i) generate
+		gen_pin : if not is_aes50_line(i) and not is_aes67_line(i) and not is_inferno_line(i) generate
 			tdm_rx(i) <= tdm_i(i);
 		end generate;
 	end generate;
@@ -497,79 +681,133 @@ begin
 	tdm_par_o <= tx_par;
 
 	------------------------------------------------------------------------
-	-- AES50 cores
+	-- AES50 module (modular N-port aes50_wb or legacy aes50_core)
 	------------------------------------------------------------------------
-	gen_aes50 : for k in 0 to G_AES50_PORTS - 1 generate
-		constant C_LINE	: natural := G_AES50_FIRST_LINE + C_AES50_LINES * k;
-		signal aes50_tdm_in		: std_logic_vector(6 downto 0);
-		signal aes50_tdm_out	: std_logic_vector(6 downto 0);
+	gen_aes50_mod : if G_AES50_PAR_BRIDGE and G_AES50_PORTS > 0 generate
+		constant C_FIRST : natural := G_AES50_FIRST_LINE;
+		constant C_LAST  : natural := G_AES50_FIRST_LINE + C_AES50_LINES * G_AES50_PORTS - 1;
 	begin
-		aes50_tdm_in <= aes50_tdm_aux_i(k) & tdm_tx(C_LINE + C_AES50_LINES - 1 downto C_LINE);
-		tdm_rx(C_LINE + C_AES50_LINES - 1 downto C_LINE) <= aes50_tdm_out(C_AES50_LINES - 1 downto 0);
-		aes50_tdm_aux_o(k) <= aes50_tdm_out(6);
-
-		u_aes50 : entity work.aes50_core
+		u_aes50_wb : entity work.aes50_wb
 			generic map (
-				G_SUPPORT_44K1 => G_AES50_SUPPORT_44K1,
-				G_UART_AUX => G_AES50_UART_AUX,
-				G_TDM_AUX => G_AES50_TDM_AUX,
-				G_UART_FIFO_AW => G_AES50_UART_FIFO_AW,
-				-- tdm_multichan_rx / _tx: MSB one BCLK after the first rising BCLK edge that sees fsync high
-				G_FSYNC_DELAY => 1,
-				G_TX_LEAD_ADJ => 0,
-				G_SIM_ASSM_SAMPLES => G_AES50_SIM_ASSM_SAMPLES)
+				G_PORTS           => G_AES50_PORTS,
+				G_ENABLE_SRC      => G_AES50_ENABLE_SRC,
+				G_ENABLE_AUX      => true,
+				G_AUX_FIFO_AW     => G_AES50_AUX_FIFO_AW,
+				G_SIM_ASSM_FRAMES => G_AES50_SIM_ASSM_SAMPLES)
 			port map (
-				clk50_i => clk50_i,
-				rst_i => aes50_rst_i,
-				fs_mode_i => aes50_fs_mode_i,
-				sys_mode_i => aes50_sys_mode_i(2 * k + 1 downto 2 * k),
-				tdm8_i2s_mode_i => '0',
-				aux_tx_tdm_uart_select_i => aes50_aux_uart_sel_i(k),
-				rmii_crs_dv_i => aes50_rmii_crs_dv_i(k),
-				rmii_rxd_i => aes50_rmii_rxd_i(2 * k + 1 downto 2 * k),
-				rmii_tx_en_o => aes50_rmii_tx_en_o(k),
-				rmii_txd_o => aes50_rmii_txd_o(2 * k + 1 downto 2 * k),
-				phy_rst_n_o => aes50_phy_rst_n_o(k),
-				aes50_clk_a_rx_i => aes50_clk_a_rx_i(k),
-				aes50_clk_a_tx_o => aes50_clk_a_tx_o(k),
-				aes50_clk_a_tx_en_o => aes50_clk_a_tx_en_o(k),
-				aes50_clk_b_rx_i => aes50_clk_b_rx_i(k),
-				aes50_clk_b_tx_o => aes50_clk_b_tx_o(k),
-				aes50_clk_b_tx_en_o => aes50_clk_b_tx_en_o(k),
-				-- the audio PLL is controlled by the layer above, the core only follows it
-				clk_1024xfs_from_pll_i => clk_fs1024_i,
-				pll_lock_n_i => '0',
-				clk_to_pll_o => open,
-				pll_mult_value_o => open,
-				pll_init_busy_i => '0',
-				mclk_o => open,
-				wclk_o => open,
-				bclk_o => open,
-				wclk_readback_i => fsync,
-				bclk_readback_i => clk_fs256,
-				wclk_out_en_o => open,
-				bclk_out_en_o => open,
-				tdm_i => aes50_tdm_in,
-				tdm_o => aes50_tdm_out,
-				i2s_i => '0',
-				i2s_o => open,
-				aes_ok_o => aes50_ok_o(k),
-				rx_blk_drop_o => open,
-				dbg_o => open,
-				uart_o => aes50_uart_o(k),
-				uart_i => aes50_uart_i(k),
-				debug_out_signal_pulse_len_i => C_AES50_10MS,
-				first_transmit_start_counter_48k_i => 0,				-- not used in v2
-				first_transmit_start_counter_44k1_i => 0,				-- not used in v2
-				wd_aes_clk_timeout_i => 25,								-- 0.5 us
-				wd_aes_rx_dv_timeout_i => 7500,							-- 150 us
-				mdix_timer_1ms_reference_i => C_AES50_1MS,
-				aes_clk_ok_counter_reference_i => C_AES50_10MS,
-				mult_clk625_48k_i => 8246337,
-				mult_clk625_44k1_i => 7576322,
-				uart_clks_per_bit_i => C_AES50_UART_CLKS,
-				uart_timeout_clks_i => C_AES50_10MS,
-				uart_overflow_o => open);
+				clk50_i             => clk50_i,
+				rst_i               => aes50_rst_i,
+				clk_1024xfs_i       => clk_fs1024_i,
+				bclk_i              => clk_fs256,
+				fsync_i             => fsync,
+				pll_lock_i          => pll_lock_i,
+				wb_adr_i            => aes50_m2s.adr,
+				wb_dat_i            => aes50_m2s.dat,
+				wb_dat_o            => aes50_s2m.dat,
+				wb_sel_i            => aes50_m2s.sel,
+				wb_cyc_i            => aes50_m2s.cyc,
+				wb_stb_i            => aes50_m2s.stb,
+				wb_we_i             => aes50_m2s.we,
+				wb_ack_o            => aes50_s2m.ack,
+				wb_err_o            => aes50_s2m.err,
+				rmii_crs_dv_i       => aes50_rmii_crs_dv_i,
+				rmii_rxd_i          => aes50_rmii_rxd_i,
+				rmii_tx_en_o        => aes50_rmii_tx_en_o,
+				rmii_txd_o          => aes50_rmii_txd_o,
+				phy_rst_n_o         => aes50_phy_rst_n_o,
+				aes50_clk_a_rx_i    => aes50_clk_a_rx_i,
+				aes50_clk_a_tx_o    => aes50_clk_a_tx_o,
+				aes50_clk_a_tx_en_o => aes50_clk_a_tx_en_o,
+				aes50_clk_b_rx_i    => aes50_clk_b_rx_i,
+				aes50_clk_b_tx_o    => aes50_clk_b_tx_o,
+				aes50_clk_b_tx_en_o => aes50_clk_b_tx_en_o,
+				clk_to_pll_o        => aes50_clk_to_pll_o,
+				tdm_i               => tdm_tx(C_LAST downto C_FIRST),
+				tdm_o               => tdm_rx(C_LAST downto C_FIRST),
+				aes_ok_o            => aes50_ok_o);
+
+		aes50_uart_o    <= (others => '1');
+		aes50_tdm_aux_o <= (others => '0');
+	end generate;
+
+	gen_no_aes50_wb : if not (G_AES50_PAR_BRIDGE and G_AES50_PORTS > 0) generate
+		aes50_s2m.dat <= (others => '0');
+		aes50_s2m.ack <= '0';
+		aes50_s2m.err <= aes50_m2s.cyc and aes50_m2s.stb;
+	end generate;
+
+	gen_aes50_legacy : if not G_AES50_PAR_BRIDGE generate
+		gen_port : for k in 0 to G_AES50_PORTS - 1 generate
+			constant C_LINE : natural := G_AES50_FIRST_LINE + C_AES50_LINES * k;
+			signal aes50_tdm_in  : std_logic_vector(6 downto 0);
+			signal aes50_tdm_out : std_logic_vector(6 downto 0);
+		begin
+			aes50_tdm_in <= aes50_tdm_aux_i(k) & tdm_tx(C_LINE + C_AES50_LINES - 1 downto C_LINE);
+			tdm_rx(C_LINE + C_AES50_LINES - 1 downto C_LINE) <= aes50_tdm_out(C_AES50_LINES - 1 downto 0);
+			aes50_tdm_aux_o(k) <= aes50_tdm_out(6);
+
+			u_aes50 : entity work.aes50_core
+				generic map (
+					G_SUPPORT_44K1 => G_AES50_SUPPORT_44K1,
+					G_UART_AUX => G_AES50_UART_AUX,
+					G_TDM_AUX => G_AES50_TDM_AUX,
+					G_UART_FIFO_AW => G_AES50_UART_FIFO_AW,
+					-- tdm_multichan_rx / _tx: MSB one BCLK after the first rising BCLK edge that sees fsync high
+					G_FSYNC_DELAY => 1,
+					G_TX_LEAD_ADJ => 0,
+					G_SIM_ASSM_SAMPLES => G_AES50_SIM_ASSM_SAMPLES)
+				port map (
+					clk50_i => clk50_i,
+					rst_i => aes50_rst_i,
+					fs_mode_i => aes50_fs_mode_i,
+					sys_mode_i => aes50_sys_mode_i(2 * k + 1 downto 2 * k),
+					tdm8_i2s_mode_i => '0',
+					aux_tx_tdm_uart_select_i => aes50_aux_uart_sel_i(k),
+					rmii_crs_dv_i => aes50_rmii_crs_dv_i(k),
+					rmii_rxd_i => aes50_rmii_rxd_i(2 * k + 1 downto 2 * k),
+					rmii_tx_en_o => aes50_rmii_tx_en_o(k),
+					rmii_txd_o => aes50_rmii_txd_o(2 * k + 1 downto 2 * k),
+					phy_rst_n_o => aes50_phy_rst_n_o(k),
+					aes50_clk_a_rx_i => aes50_clk_a_rx_i(k),
+					aes50_clk_a_tx_o => aes50_clk_a_tx_o(k),
+					aes50_clk_a_tx_en_o => aes50_clk_a_tx_en_o(k),
+					aes50_clk_b_rx_i => aes50_clk_b_rx_i(k),
+					aes50_clk_b_tx_o => aes50_clk_b_tx_o(k),
+					aes50_clk_b_tx_en_o => aes50_clk_b_tx_en_o(k),
+					clk_1024xfs_from_pll_i => clk_fs1024_i,
+					pll_lock_n_i => not pll_lock_i,
+					clk_to_pll_o => aes50_clk_to_pll_o(k),
+					pll_mult_value_o => open,
+					pll_init_busy_i => '0',
+					mclk_o => open,
+					wclk_o => open,
+					bclk_o => open,
+					wclk_readback_i => fsync,
+					bclk_readback_i => clk_fs256,
+					wclk_out_en_o => open,
+					bclk_out_en_o => open,
+					tdm_i => aes50_tdm_in,
+					tdm_o => aes50_tdm_out,
+					i2s_i => '0',
+					i2s_o => open,
+					aes_ok_o => aes50_ok_o(k),
+					rx_blk_drop_o => open,
+					dbg_o => open,
+					uart_o => aes50_uart_o(k),
+					uart_i => aes50_uart_i(k),
+					debug_out_signal_pulse_len_i => C_AES50_10MS,
+					first_transmit_start_counter_48k_i => 0,
+					first_transmit_start_counter_44k1_i => 0,
+					wd_aes_clk_timeout_i => 25,
+					wd_aes_rx_dv_timeout_i => 7500,
+					mdix_timer_1ms_reference_i => C_AES50_1MS,
+					aes_clk_ok_counter_reference_i => C_AES50_10MS,
+					mult_clk625_48k_i => 8246337,
+					mult_clk625_44k1_i => 7576322,
+					uart_clks_per_bit_i => C_AES50_UART_CLKS,
+					uart_timeout_clks_i => C_AES50_10MS,
+					uart_overflow_o => open);
+		end generate;
 	end generate;
 
 	------------------------------------------------------------------------
@@ -622,5 +860,50 @@ begin
 		aes67_rmii_txd_o <= "00";
 		aes67_irq_o <= '0';
 		aes67_pll_ref_o <= '0';
+	end generate;
+
+	------------------------------------------------------------------------
+	-- OpenInferno core (optional, mutually exclusive with G_AES67)
+	------------------------------------------------------------------------
+	gen_inferno : if G_INFERNO generate
+		constant C_LINE : natural := G_INFERNO_FIRST_LINE;
+	begin
+		u_inferno : inferno_wb
+			generic map (
+				G_MAX_CH  => 48,
+				G_MAX_FPP => 16,
+				G_NR      => 64,
+				G_NF      => 64,
+				G_MAXLAT  => 1,
+				G_TXW     => 512,
+				G_RXW     => G_INFERNO_RXW)
+			port map (
+				clk50_i       => clk50_i,
+				rst_i         => inferno_rst_i,
+				bclk_i        => clk_fs256,
+				fsync_i       => fsync,
+				rmii_crs_dv_i => inferno_rmii_crs_dv_i,
+				rmii_rxd_i    => inferno_rmii_rxd_i,
+				rmii_tx_en_o  => inferno_rmii_tx_en_o,
+				rmii_txd_o    => inferno_rmii_txd_o,
+				tdm_i         => tdm_tx(C_LINE + C_INFERNO_LINES - 1 downto C_LINE),
+				tdm_o         => tdm_rx(C_LINE + C_INFERNO_LINES - 1 downto C_LINE),
+				wb_adr_i      => inferno_m2s.adr,
+				wb_dat_i      => inferno_m2s.dat,
+				wb_dat_o      => inferno_s2m.dat,
+				wb_sel_i      => inferno_m2s.sel,
+				wb_cyc_i      => inferno_m2s.cyc,
+				wb_stb_i      => inferno_m2s.stb,
+				wb_we_i       => inferno_m2s.we,
+				wb_ack_o      => inferno_s2m.ack,
+				wb_err_o      => inferno_s2m.err);
+	end generate;
+
+	gen_no_inferno : if not G_INFERNO generate
+		inferno_s2m.dat     <= (others => '0');
+		inferno_s2m.ack     <= '0';
+		inferno_s2m.err     <= inferno_m2s.cyc and inferno_m2s.stb;
+		inferno_rmii_tx_en_o <= '0';
+		inferno_rmii_txd_o   <= "00";
 	end generate;
 end architecture rtl;
